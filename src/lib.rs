@@ -12,7 +12,7 @@ mod sharded;
 mod source;
 mod stream;
 
-pub use balance::{LatencyBalancerOptions, ReplicaSnapshot};
+pub use balance::{QuotaBalancerOptions, ReplicaSnapshot};
 pub use client::TcpClient;
 pub use dns::{DnsOptions, DnsResolver, DnsResolverOptions, DnsSource};
 pub use error::{CallError, NetError, Result};
