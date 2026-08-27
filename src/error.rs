@@ -28,6 +28,9 @@ pub enum NetError {
         source: io::Error,
     },
 
+    #[error("shared DNS resolver task stopped")]
+    DnsResolverStopped,
+
     #[error("failed to connect to {endpoint}: {source}")]
     Connect {
         endpoint: SocketAddr,

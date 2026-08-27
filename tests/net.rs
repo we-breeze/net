@@ -75,6 +75,20 @@ fn node(address: SocketAddr) -> NodePool {
     NodePool::from_endpoints([address], NodePoolOptions::default()).unwrap()
 }
 
+#[test]
+fn endpoint_updates_publish_immutable_cow_snapshots() {
+    let first = "127.0.0.1:1001".parse().unwrap();
+    let second = "127.0.0.1:1002".parse().unwrap();
+    let endpoints = EndpointSet::new([first]);
+
+    let before = endpoints.snapshot();
+    assert!(endpoints.replace([second]));
+    let after = endpoints.snapshot();
+
+    assert_eq!(before.as_ref(), [first]);
+    assert_eq!(after.as_ref(), [second]);
+}
+
 async fn request<K, P>(provider: &P, key: &K) -> Result<u8, CallError<io::Error>>
 where
     K: ?Sized + Sync,

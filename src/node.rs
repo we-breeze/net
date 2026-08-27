@@ -13,8 +13,8 @@ use parking_lot::Mutex;
 use tokio::{net::TcpStream, sync::Notify};
 
 use crate::{
-    BoxFuture, BrzTcpStream, DnsOptions, DnsSource, EndpointSet, EndpointSource, NetError, Result,
-    StreamProvider, stream::ManagedConnection,
+    BoxFuture, BrzTcpStream, DnsOptions, DnsResolver, DnsSource, EndpointSet, EndpointSource,
+    NetError, Result, StreamProvider, stream::ManagedConnection,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -53,8 +53,7 @@ pub struct NodePool {
 }
 
 pub(crate) struct NodePoolInner {
-    _source: Arc<dyn EndpointSource>,
-    endpoints: tokio::sync::watch::Receiver<Arc<[SocketAddr]>>,
+    source: Arc<dyn EndpointSource>,
     state: Mutex<ConnectionState>,
     notify: Notify,
     next_endpoint: AtomicUsize,
@@ -76,11 +75,9 @@ impl NodePool {
     pub fn new(source: impl EndpointSource + 'static, options: NodePoolOptions) -> Result<Self> {
         validate_options(options)?;
         let source: Arc<dyn EndpointSource> = Arc::new(source);
-        let endpoints = source.subscribe();
         Ok(Self {
             inner: Arc::new(NodePoolInner {
-                _source: source,
-                endpoints,
+                source,
                 state: Mutex::new(ConnectionState::default()),
                 notify: Notify::new(),
                 next_endpoint: AtomicUsize::new(0),
@@ -104,6 +101,19 @@ impl NodePool {
         Self::new(DnsSource::new(names, dns_options).await?, pool_options)
     }
 
+    /// Build from DNS using an explicitly shared resolver.
+    pub async fn from_dns_with_resolver(
+        resolver: &DnsResolver,
+        names: impl IntoIterator<Item = impl Into<String>>,
+        dns_options: DnsOptions,
+        pool_options: NodePoolOptions,
+    ) -> Result<Self> {
+        Self::new(
+            DnsSource::with_resolver(resolver, names, dns_options).await?,
+            pool_options,
+        )
+    }
+
     pub fn stats(&self) -> NodePoolStats {
         let state = self.inner.state.lock();
         NodePoolStats {
@@ -115,7 +125,7 @@ impl NodePool {
 
     async fn acquire_stream(&self) -> Result<BrzTcpStream> {
         loop {
-            let endpoints = self.inner.endpoints.borrow().clone();
+            let endpoints = self.inner.source.snapshot();
             let notified = self.inner.notify.notified();
 
             let (action, freed) = {
@@ -160,7 +170,7 @@ impl fmt::Debug for NodePool {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NodePool")
-            .field("endpoints", &self.inner.endpoints.borrow().as_ref())
+            .field("endpoints", &self.inner.source.snapshot())
             .field("options", &self.inner.options)
             .field("stats", &self.stats())
             .finish()
@@ -201,7 +211,7 @@ impl NodePoolInner {
     }
 
     pub(crate) fn recycle(&self, connection: ManagedConnection) {
-        let endpoints = self.endpoints.borrow().clone();
+        let endpoints = self.source.snapshot();
         let mut connection = Some(connection);
         let mut state = self.state.lock();
         let freed = prune_idle(&mut state, &endpoints, self.options.idle_timeout);

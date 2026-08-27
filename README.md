@@ -64,8 +64,33 @@ let value = node
 
 ## 动态 endpoint
 
-`EndpointSet` 可由 Vintage 等发现适配器更新；`DnsSource` 会定期重新解析多个
-`host:port`。新请求总是使用最新快照，已移除 endpoint 的空闲连接不会再复用。
+`EndpointSet` 使用 copy-on-write 不可变快照并原子发布更新，可由 Vintage 等发现
+适配器更新。连接获取路径只读取快照，不会与发现更新争用共享锁。新请求总是使用
+最新快照，已移除 endpoint 的空闲连接不会再复用。
+
+`DnsSource` 只接受 IPv4 hostname，默认复用进程级 `DnsResolver`。解析器按 hostname
+去重（端口由订阅者各自保留），不会为每个 `NodePool` 创建定时任务：新注册域名在
+下一个 1 秒调度 tick 执行首次解析，之后才按 `refresh_interval` 分散刷新。查询并发
+默认限制为 32；解析失败保留最后一次成功结果，只有地址集合实际变化时才发布新
+快照。
+
+大量域名也可以显式共享一个带自定义并发上限的解析器：
+
+```rust,ignore
+use brz_net::{DnsOptions, DnsResolver, DnsResolverOptions, NodePool, NodePoolOptions};
+
+let resolver = DnsResolver::new(DnsResolverOptions {
+    max_concurrent_lookups: 16,
+    ..DnsResolverOptions::default()
+})?;
+let node = NodePool::from_dns_with_resolver(
+    &resolver,
+    ["redis.example:6379"],
+    DnsOptions::default(),
+    NodePoolOptions::default(),
+)
+.await?;
+```
 
 ## 第一版边界
 
