@@ -10,7 +10,7 @@ use std::{
 };
 
 use net::{
-    CallError, EndpointSet, LatencyBalancerOptions, NetError, NodePool, NodePoolOptions, Pool,
+    CallError, EndpointSet, NetError, NodePool, NodePoolOptions, Pool, QuotaBalancerOptions,
     Sharded, StreamProvider, TcpClient,
 };
 use tokio::{
@@ -427,20 +427,33 @@ fn modulo(key: &u64, shard_count: usize) -> usize {
     *key as usize % shard_count
 }
 
+fn quick_quota() -> QuotaBalancerOptions {
+    QuotaBalancerOptions {
+        quota: Duration::from_micros(1),
+        ..QuotaBalancerOptions::default()
+    }
+}
+
 #[tokio::test]
 async fn redis_composition_shards_before_balancing_replicas() {
     let shard_zero_a = TestServer::start(20).await;
     let shard_zero_b = TestServer::start(21).await;
     let shard_one = TestServer::start(30).await;
 
-    let shard_zero = Pool::new([node(shard_zero_a.address), node(shard_zero_b.address)]).unwrap();
+    let shard_zero = Pool::with_options(
+        [node(shard_zero_a.address), node(shard_zero_b.address)],
+        quick_quota(),
+    )
+    .unwrap();
     let shard_one = Pool::new([node(shard_one.address)]).unwrap();
     let redis = Sharded::new(modulo as fn(&u64, usize) -> usize, [shard_zero, shard_one]).unwrap();
 
     assert_eq!(request(&redis, &1).await.unwrap(), 30);
     let first = request(&redis, &0).await.unwrap();
     let second = request(&redis, &0).await.unwrap();
-    assert_eq!([first, second], [20, 21]);
+    let mut identities = [first, second];
+    identities.sort_unstable();
+    assert_eq!(identities, [20, 21]);
 }
 
 #[tokio::test]
@@ -461,33 +474,29 @@ async fn mc_composition_balances_before_each_replica_shards() {
         [node(b0.address), node(b1.address), node(b2.address)],
     )
     .unwrap();
-    let mc = Pool::new([replica_a, replica_b]).unwrap();
+    let mc = Pool::with_options([replica_a, replica_b], quick_quota()).unwrap();
 
     // key 4 maps to shard 0 in the two-node replica and shard 1 in the
     // three-node replica. The first two calls explore both full replicas.
-    assert_eq!(request(&mc, &4).await.unwrap(), 40);
-    assert_eq!(request(&mc, &4).await.unwrap(), 51);
+    let mut identities = [
+        request(&mc, &4).await.unwrap(),
+        request(&mc, &4).await.unwrap(),
+    ];
+    identities.sort_unstable();
+    assert_eq!(identities, [40, 51]);
 }
 
 #[tokio::test]
-async fn failed_replicas_are_ejected_for_fast_failure() {
-    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let unavailable = unused.local_addr().unwrap();
-    drop(unused);
-    let healthy = TestServer::start(60).await;
+async fn quota_pool_rotates_only_after_the_current_replica_consumes_its_quota() {
+    let first = TestServer::start(60).await;
+    let second = TestServer::start(61).await;
+    let pool =
+        Pool::with_options([node(first.address), node(second.address)], quick_quota()).unwrap();
 
-    let options = LatencyBalancerOptions {
-        failure_threshold: 1,
-        ejection_duration: Duration::from_secs(30),
-        ..LatencyBalancerOptions::default()
-    };
-    let pool = Pool::with_options([node(unavailable), node(healthy.address)], options).unwrap();
+    let first_identity = request(&pool, &NO_KEY).await.unwrap();
+    let second_identity = request(&pool, &NO_KEY).await.unwrap();
+    let third_identity = request(&pool, &NO_KEY).await.unwrap();
 
-    let first = request(&pool, &NO_KEY).await;
-    assert!(matches!(
-        first,
-        Err(CallError::Net(NetError::Connect { .. }))
-    ));
-    assert!(pool.snapshots()[0].ejected);
-    assert_eq!(request(&pool, &NO_KEY).await.unwrap(), 60);
+    assert_ne!(first_identity, second_identity);
+    assert_eq!(third_identity, first_identity);
 }

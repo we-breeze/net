@@ -1,229 +1,271 @@
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
-
-use parking_lot::Mutex;
 
 use crate::{NetError, Result, stream::StreamObserver};
 
 #[derive(Clone, Copy, Debug)]
-pub struct LatencyBalancerOptions {
-    pub initial_latency: Duration,
+pub struct QuotaBalancerOptions {
+    /// Completed request time consumed before advancing to the next replica.
+    pub quota: Duration,
+    /// Minimum quota charged for a failed request.
     pub failure_penalty: Duration,
-    pub failure_threshold: u32,
-    pub ejection_duration: Duration,
-    pub ewma_weight: f64,
 }
 
-impl Default for LatencyBalancerOptions {
+impl Default for QuotaBalancerOptions {
     fn default() -> Self {
         Self {
-            initial_latency: Duration::from_millis(1),
-            failure_penalty: Duration::from_millis(100),
-            failure_threshold: 3,
-            ejection_duration: Duration::from_secs(1),
-            ewma_weight: 0.2,
+            quota: Duration::from_secs(2),
+            failure_penalty: Duration::from_millis(500),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaSnapshot {
-    pub latency: Duration,
-    pub inflight: usize,
-    pub consecutive_failures: u32,
-    pub samples: u64,
-    pub ejected: bool,
+    pub used_quota: Duration,
+    pub current: bool,
 }
 
 #[derive(Clone)]
-pub(crate) struct LatencyBalancer {
+pub(crate) struct QuotaBalancer {
     inner: Arc<BalancerInner>,
 }
 
 struct BalancerInner {
-    state: Mutex<BalancerState>,
-    options: LatencyBalancerOptions,
-}
-
-struct BalancerState {
-    replicas: Vec<ReplicaState>,
-    cursor: usize,
+    current: AtomicUsize,
+    replicas: Box<[ReplicaState]>,
+    quota_micros: u64,
+    failure_penalty_micros: u64,
 }
 
 struct ReplicaState {
-    latency_secs: f64,
-    inflight: usize,
-    consecutive_failures: u32,
-    samples: u64,
-    ejected_until: Option<Instant>,
+    used_micros: AtomicU64,
 }
 
-impl LatencyBalancer {
-    pub(crate) fn new(replicas: usize, options: LatencyBalancerOptions) -> Result<Self> {
+impl QuotaBalancer {
+    pub(crate) fn new(replicas: usize, options: QuotaBalancerOptions) -> Result<Self> {
         validate_options(options)?;
+        if replicas == 0 {
+            return Err(NetError::NoReplicas);
+        }
+
         Ok(Self {
             inner: Arc::new(BalancerInner {
-                state: Mutex::new(BalancerState {
-                    replicas: (0..replicas)
-                        .map(|_| ReplicaState {
-                            latency_secs: options.initial_latency.as_secs_f64(),
-                            inflight: 0,
-                            consecutive_failures: 0,
-                            samples: 0,
-                            ejected_until: None,
-                        })
-                        .collect(),
-                    cursor: 0,
-                }),
-                options,
+                current: AtomicUsize::new(0),
+                replicas: (0..replicas)
+                    .map(|_| ReplicaState {
+                        used_micros: AtomicU64::new(0),
+                    })
+                    .collect(),
+                quota_micros: duration_micros(options.quota),
+                failure_penalty_micros: duration_micros(options.failure_penalty),
             }),
         })
     }
 
-    pub(crate) fn select(&self) -> Result<BalanceGuard> {
-        let now = Instant::now();
-        let mut state = self.inner.state.lock();
-        let count = state.replicas.len();
-        if count == 0 {
-            return Err(NetError::NoReplicas);
-        }
+    #[inline]
+    pub(crate) fn select(&self) -> QuotaGuard {
+        let count = self.inner.replicas.len();
+        let mut index = self.inner.current.load(Ordering::Relaxed);
 
-        for replica in &mut state.replicas {
-            if replica.ejected_until.is_some_and(|until| until <= now) {
-                replica.ejected_until = None;
+        if count > 1
+            && self.inner.replicas[index]
+                .used_micros
+                .load(Ordering::Relaxed)
+                >= self.inner.quota_micros
+        {
+            let next = (index + 1) % count;
+            if self
+                .inner
+                .current
+                .compare_exchange(index, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.inner.replicas[index]
+                    .used_micros
+                    .store(0, Ordering::Relaxed);
+                index = next;
+            } else {
+                index = self.inner.current.load(Ordering::Acquire);
             }
         }
 
-        let start = state.cursor % count;
-        let unobserved = (0..count)
-            .map(|offset| (start + offset) % count)
-            .find(|&index| {
-                let replica = &state.replicas[index];
-                replica.ejected_until.is_none() && replica.samples == 0
-            });
-
-        let selected = unobserved.or_else(|| {
-            (0..count)
-                .map(|offset| (start + offset) % count)
-                .filter(|&index| state.replicas[index].ejected_until.is_none())
-                .min_by(|&left, &right| {
-                    score(&state.replicas[left]).total_cmp(&score(&state.replicas[right]))
-                })
-        });
-
-        let Some(selected) = selected else {
-            return Err(NetError::NoHealthyReplicas);
-        };
-
-        state.cursor = (selected + 1) % count;
-        state.replicas[selected].inflight += 1;
-        drop(state);
-
-        Ok(BalanceGuard {
+        QuotaGuard {
             balancer: self.inner.clone(),
-            index: selected,
+            index,
             started: Instant::now(),
             finished: false,
-        })
+        }
     }
 
     pub(crate) fn snapshots(&self) -> Vec<ReplicaSnapshot> {
-        let now = Instant::now();
+        let current = self.inner.current.load(Ordering::Relaxed);
         self.inner
-            .state
-            .lock()
             .replicas
             .iter()
-            .map(|replica| ReplicaSnapshot {
-                latency: Duration::from_secs_f64(replica.latency_secs),
-                inflight: replica.inflight,
-                consecutive_failures: replica.consecutive_failures,
-                samples: replica.samples,
-                ejected: replica.ejected_until.is_some_and(|until| until > now),
+            .enumerate()
+            .map(|(index, replica)| ReplicaSnapshot {
+                used_quota: Duration::from_micros(replica.used_micros.load(Ordering::Relaxed)),
+                current: index == current,
             })
             .collect()
     }
 }
 
-pub(crate) struct BalanceGuard {
+pub(crate) struct QuotaGuard {
     balancer: Arc<BalancerInner>,
     index: usize,
     started: Instant,
     finished: bool,
 }
 
-impl BalanceGuard {
+impl QuotaGuard {
     pub(crate) fn index(&self) -> usize {
         self.index
     }
 
     fn finish(mut self, succeeded: bool) {
-        self.record(succeeded);
+        let elapsed = self.started.elapsed();
+        self.record(elapsed, succeeded);
         self.finished = true;
     }
 
-    fn record(&self, succeeded: bool) {
-        let elapsed = self.started.elapsed().as_secs_f64();
-        let mut state = self.balancer.state.lock();
-        let replica = &mut state.replicas[self.index];
-        replica.inflight = replica.inflight.saturating_sub(1);
-
-        let sample = if succeeded {
+    fn record(&self, elapsed: Duration, succeeded: bool) {
+        let elapsed = duration_micros(elapsed);
+        let charge = if succeeded {
             elapsed
         } else {
-            elapsed.max(self.balancer.options.failure_penalty.as_secs_f64())
+            elapsed.max(self.balancer.failure_penalty_micros)
         };
-        replica.latency_secs = if replica.samples == 0 {
-            sample
-        } else {
-            let weight = self.balancer.options.ewma_weight;
-            replica.latency_secs * (1.0 - weight) + sample * weight
-        };
-        replica.samples += 1;
-
-        if succeeded {
-            replica.consecutive_failures = 0;
-            replica.ejected_until = None;
-        } else {
-            replica.consecutive_failures = replica.consecutive_failures.saturating_add(1);
-            if replica.consecutive_failures >= self.balancer.options.failure_threshold {
-                replica.ejected_until =
-                    Some(Instant::now() + self.balancer.options.ejection_duration);
-            }
-        }
+        self.balancer.replicas[self.index]
+            .used_micros
+            .fetch_add(charge, Ordering::Relaxed);
     }
 }
 
-impl StreamObserver for BalanceGuard {
+impl StreamObserver for QuotaGuard {
     fn succeeded(self: Box<Self>) {
         (*self).finish(true);
     }
 }
 
-impl Drop for BalanceGuard {
+impl Drop for QuotaGuard {
     fn drop(&mut self) {
         if !self.finished {
-            self.record(false);
+            self.record(self.started.elapsed(), false);
         }
     }
 }
 
-fn score(replica: &ReplicaState) -> f64 {
-    replica.latency_secs * (replica.inflight as f64 + 1.0)
+fn duration_micros(duration: Duration) -> u64 {
+    duration.as_micros().min(u64::MAX as u128) as u64
 }
 
-fn validate_options(options: LatencyBalancerOptions) -> Result<()> {
-    if options.failure_threshold == 0 {
+fn validate_options(options: QuotaBalancerOptions) -> Result<()> {
+    if duration_micros(options.quota) == 0 {
         return Err(NetError::InvalidConfig(
-            "failure_threshold must be greater than zero".into(),
+            "quota must be at least one microsecond".into(),
         ));
     }
-    if !(0.0..=1.0).contains(&options.ewma_weight) || options.ewma_weight == 0.0 {
+    if duration_micros(options.failure_penalty) == 0 {
         return Err(NetError::InvalidConfig(
-            "ewma_weight must be in the range (0, 1]".into(),
+            "failure_penalty must be at least one microsecond".into(),
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+
+    use super::*;
+
+    fn finish(mut guard: QuotaGuard, elapsed: Duration, succeeded: bool) {
+        guard.record(elapsed, succeeded);
+        guard.finished = true;
+    }
+
+    #[test]
+    fn requests_stay_on_one_replica_until_its_quota_is_consumed() {
+        let balancer = QuotaBalancer::new(3, QuotaBalancerOptions::default()).unwrap();
+
+        let first = balancer.select();
+        assert_eq!(first.index(), 0);
+        finish(first, Duration::from_millis(1_200), true);
+
+        let second = balancer.select();
+        assert_eq!(second.index(), 0);
+        finish(second, Duration::from_millis(900), true);
+
+        let third = balancer.select();
+        assert_eq!(third.index(), 1);
+        finish(third, Duration::ZERO, true);
+
+        let snapshots = balancer.snapshots();
+        assert_eq!(snapshots[0].used_quota, Duration::ZERO);
+        assert!(snapshots[1].current);
+    }
+
+    #[test]
+    fn failed_requests_consume_at_least_five_hundred_milliseconds() {
+        let balancer = QuotaBalancer::new(2, QuotaBalancerOptions::default()).unwrap();
+
+        for _ in 0..4 {
+            let guard = balancer.select();
+            assert_eq!(guard.index(), 0);
+            finish(guard, Duration::from_millis(1), false);
+        }
+
+        assert_eq!(balancer.snapshots()[0].used_quota, Duration::from_secs(2));
+        let next = balancer.select();
+        assert_eq!(next.index(), 1);
+        finish(next, Duration::ZERO, true);
+    }
+
+    #[test]
+    fn concurrent_selectors_observe_one_atomic_quota_rotation() {
+        let balancer = QuotaBalancer::new(3, QuotaBalancerOptions::default()).unwrap();
+        finish(balancer.select(), Duration::from_secs(2), true);
+
+        let workers = 16;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let balancer = balancer.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let guard = balancer.select();
+                    let index = guard.index();
+                    finish(guard, Duration::ZERO, true);
+                    index
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1);
+        }
+        assert!(balancer.snapshots()[1].current);
+    }
+
+    #[test]
+    fn invalid_sub_microsecond_options_are_rejected() {
+        let error = QuotaBalancer::new(
+            2,
+            QuotaBalancerOptions {
+                quota: Duration::from_nanos(999),
+                ..QuotaBalancerOptions::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, NetError::InvalidConfig(_)));
+    }
 }

@@ -1,31 +1,33 @@
-use std::{fmt, sync::Arc};
+use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher, sync::Arc};
 
 use crate::{
-    BoxFuture, BrzTcpStream, LatencyBalancerOptions, ReplicaSnapshot, Result, StreamProvider,
-    balance::LatencyBalancer,
+    BoxFuture, BrzTcpStream, QuotaBalancerOptions, ReplicaSnapshot, Result, StreamProvider,
+    balance::QuotaBalancer,
 };
 
-/// Selects one of several equivalent providers using observed request latency.
+/// Selects one of several equivalent providers using consumed request-time quota.
 #[derive(Clone)]
 pub struct Pool<C> {
     replicas: Arc<[C]>,
-    balancer: LatencyBalancer,
+    balancer: QuotaBalancer,
 }
 
 impl<C> Pool<C> {
     pub fn new(replicas: impl IntoIterator<Item = C>) -> Result<Self> {
-        Self::with_options(replicas, LatencyBalancerOptions::default())
+        Self::with_options(replicas, QuotaBalancerOptions::default())
     }
 
     pub fn with_options(
         replicas: impl IntoIterator<Item = C>,
-        options: LatencyBalancerOptions,
+        options: QuotaBalancerOptions,
     ) -> Result<Self> {
-        let replicas: Arc<[C]> = replicas.into_iter().collect::<Vec<_>>().into();
+        let mut replicas = replicas.into_iter().collect::<Vec<_>>();
         if replicas.is_empty() {
             return Err(crate::NetError::NoReplicas);
         }
-        let balancer = LatencyBalancer::new(replicas.len(), options)?;
+        shuffle(&mut replicas);
+        let balancer = QuotaBalancer::new(replicas.len(), options)?;
+        let replicas = replicas.into();
         Ok(Self { replicas, balancer })
     }
 
@@ -55,11 +57,19 @@ where
 {
     fn acquire<'a>(&'a self, key: &'a K) -> BoxFuture<'a, Result<BrzTcpStream>> {
         Box::pin(async move {
-            let guard = self.balancer.select()?;
+            let guard = self.balancer.select();
             let index = guard.index();
             let mut stream = self.replicas[index].acquire(key).await?;
             stream.add_observer(Box::new(guard));
             Ok(stream)
         })
+    }
+}
+
+fn shuffle<T>(values: &mut [T]) {
+    let random = RandomState::new();
+    for upper in (1..values.len()).rev() {
+        let index = random.hash_one(upper) as usize % (upper + 1);
+        values.swap(upper, index);
     }
 }

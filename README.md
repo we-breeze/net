@@ -13,7 +13,7 @@ brz-net = { package = "net", git = "https://github.com/we-breeze/net.git" }
 - `BrzTcpStream`：持有一条物理连接，实现 Tokio `AsyncRead`、
   `AsyncWrite`、`Unpin` 和 `Send`。
 - `NodePool`：管理一个逻辑节点的 endpoint 发现、建连、空闲连接和回收。
-- `Pool<C>`：在多个等价 `C` 之间按观测耗时负载均衡并快速隔离连续失败者。
+- `Pool<C>`：在多个等价 `C` 之间按累计请求耗时 quota 轮转。
 - `Sharded<C, R>`：使用 key 和 `ShardRouter` 选择一个 `C`。
 - `StreamProvider<K>`：以上组件共同实现的组合接口。
 - `TcpClient<P>`：包裹最终组合，在最外层实施统一 operation deadline。
@@ -33,6 +33,32 @@ type MotanNet = Pool<NodePool>;
 
 每个 `Sharded` 都持有自己的 router 和 shard 数量，因此 MC 的不同完整副本
 可以具有不同的分片数。
+
+## 副本选择
+
+`Pool` 初始化时随机排列副本，之后从第一个副本开始选择。当前副本累计完成的请求
+耗时达到默认 2 秒 quota 后，下一个请求原子切换到下一个副本，并清空原副本 quota。
+因此相同 quota 内，耗时越高的副本获得的请求数量越少。
+
+成功请求按实际耗时累加；失败、取消或连接获取错误至少消耗 500ms quota。选择和
+计数热路径只使用原子操作，不遍历副本。高并发时已经发出的请求可能让 quota 略微
+超出 2 秒，这是有意保留的近似行为。本层目前不自动重试失败请求。
+
+可通过 `QuotaBalancerOptions` 调整 quota 和失败计费：
+
+```rust,ignore
+use std::time::Duration;
+
+use brz_net::{Pool, QuotaBalancerOptions};
+
+let pool = Pool::with_options(
+    replicas,
+    QuotaBalancerOptions {
+        quota: Duration::from_secs(2),
+        failure_penalty: Duration::from_millis(500),
+    },
+)?;
+```
 
 `NodePoolOptions::default()` 面向低延迟请求：
 

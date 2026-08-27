@@ -9,9 +9,6 @@ pub enum NetError {
     #[error("replica pool contains no replicas")]
     NoReplicas,
 
-    #[error("all replicas are temporarily unavailable")]
-    NoHealthyReplicas,
-
     #[error("sharded provider contains no shards")]
     NoShards,
 
