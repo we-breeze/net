@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, time::Duration};
 
 /// Errors produced by the network layer itself.
 #[derive(Debug, thiserror::Error)]
@@ -28,12 +28,21 @@ pub enum NetError {
         source: io::Error,
     },
 
+    #[error("shared DNS resolver task stopped")]
+    DnsResolverStopped,
+
     #[error("failed to connect to {endpoint}: {source}")]
     Connect {
         endpoint: SocketAddr,
         #[source]
         source: io::Error,
     },
+
+    #[error("node connection pool is exhausted (max {max_connections})")]
+    PoolExhausted { max_connections: usize },
+
+    #[error("shared node-pool maintainer stopped")]
+    PoolMaintainerStopped,
 }
 
 /// The result type used by provider construction and connection acquisition.
@@ -45,6 +54,9 @@ pub enum CallError<E> {
     #[error(transparent)]
     Net(#[from] NetError),
 
+    #[error("network operation timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+
     #[error("protocol operation failed")]
     Operation(E),
 }
@@ -53,7 +65,7 @@ impl<E> CallError<E> {
     pub fn into_operation(self) -> Option<E> {
         match self {
             Self::Operation(error) => Some(error),
-            Self::Net(_) => None,
+            Self::Net(_) | Self::Timeout { .. } => None,
         }
     }
 }
