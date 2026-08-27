@@ -37,6 +37,12 @@ pub enum NetError {
         #[source]
         source: io::Error,
     },
+
+    #[error("node connection pool is exhausted (max {max_connections})")]
+    PoolExhausted { max_connections: usize },
+
+    #[error("shared node-pool maintainer stopped")]
+    PoolMaintainerStopped,
 }
 
 /// The result type used by provider construction and connection acquisition.

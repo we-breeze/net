@@ -34,6 +34,17 @@ type MotanNet = Pool<NodePool>;
 每个 `Sharded` 都持有自己的 router 和 shard 数量，因此 MC 的不同完整副本
 可以具有不同的分片数。
 
+`NodePoolOptions::default()` 面向低延迟请求：
+
+- `min_connections = 1`，后台保持至少一条可用连接；
+- `max_connections = 256`；
+- `idle_timeout = 300s`；
+- `tcp_nodelay = true`，关闭 Nagle 聚合，优先降低小包请求延迟。
+
+没有空闲连接时，请求会在未达到 `max_connections` 的前提下直接建立新连接；
+容量已满则立即返回 `NetError::PoolExhausted`，不会排队等待。调用方可以据此重试、
+选择其他副本或快速失败。
+
 ## 使用连接
 
 `TcpClient::with_conn` 是主要入口。回调成功时连接才会回收到原 `NodePool`；回调
@@ -67,15 +78,32 @@ let value = client
 协议实现必须在返回 `Ok` 前完成一次完整的请求/响应交换，不能把留有未消费
 数据的连接标记为成功。
 
-每次调用只创建一个 Tokio `timeout_at`，使用同一个绝对 deadline 覆盖等待连接池、
+每次调用只创建一个 Tokio `timeout_at`，使用同一个绝对 deadline 覆盖连接获取、
 建连、写请求和读取完整响应。超时取消 Future 后，可能已经部分读写的物理连接会被
 丢弃，并自动归还 `NodePool` 的连接计数。
+
+只有完整操作返回 `Ok` 的连接才会回池。协议错误、I/O 错误、Future 取消和超时的
+连接都会直接关闭，不进入空闲池。
+
+## 连接维护
+
+请求路径不扫描过期连接，也不检查每条空闲连接是否仍属于最新 DNS/endpoint 集合。
+进程级共享维护器每秒扫描一次所有存活的 `NodePool`，在后台完成：
+
+- 清除已经从 endpoint 集合移除的空闲连接；
+- 清除超过 `idle_timeout` 的空闲连接，但保留 `min_connections`；
+- 异步补足 `min_connections`。
+
+后台补连接全进程同时只发起一个，避免大量节点启动时形成建连尖峰；请求触发的按需
+建连不受这个后台限制。`NodePool` 需要在 Tokio runtime 内创建。默认每个逻辑节点
+保持一条连接，因此万级节点场景会相应保留万级基础连接；不需要预热时可显式配置
+`min_connections = 0`。
 
 ## 动态 endpoint
 
 `EndpointSet` 使用 copy-on-write 不可变快照并原子发布更新，可由 Vintage 等发现
-适配器更新。连接获取路径只读取快照，不会与发现更新争用共享锁。新请求总是使用
-最新快照，已移除 endpoint 的空闲连接不会再复用。
+适配器更新。连接获取路径只读取快照，不会与发现更新争用共享锁。已移除 endpoint
+的空闲连接由共享维护器在下一个维护 tick 清除，避免把集合遍历放到请求路径。
 
 `DnsSource` 只接受 IPv4 hostname，默认复用进程级 `DnsResolver`。解析器按 hostname
 去重（端口由订阅者各自保留），不会为每个 `NodePool` 创建定时任务：新注册域名在

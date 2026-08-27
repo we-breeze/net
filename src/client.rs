@@ -8,7 +8,7 @@ use crate::{
 
 /// Applies one operation deadline around a fully composed stream provider.
 ///
-/// The deadline covers connection-pool waiting, connection establishment, the
+/// The deadline covers connection acquisition, connection establishment, the
 /// protocol write, and the complete response read. A timeout cancels the
 /// operation future; the leased [`BrzTcpStream`] is then dropped and cannot be
 /// recycled with partially consumed protocol data.

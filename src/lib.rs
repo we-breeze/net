@@ -4,6 +4,7 @@ mod balance;
 mod client;
 mod dns;
 mod error;
+mod maintenance;
 mod node;
 mod pool;
 mod provider;

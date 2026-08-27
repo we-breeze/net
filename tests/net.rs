@@ -120,7 +120,24 @@ impl Drop for TestServer {
 }
 
 fn node(address: SocketAddr) -> NodePool {
-    NodePool::from_endpoints([address], NodePoolOptions::default()).unwrap()
+    NodePool::from_endpoints(
+        [address],
+        NodePoolOptions {
+            min_connections: 0,
+            ..NodePoolOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(timeout, async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("condition was not met before timeout");
 }
 
 #[test]
@@ -161,7 +178,16 @@ fn brz_stream_has_standard_async_io_traits() {
 }
 
 #[test]
-fn zero_operation_timeout_is_rejected() {
+fn node_pool_defaults_prioritize_ready_low_latency_connections() {
+    let options = NodePoolOptions::default();
+    assert_eq!(options.min_connections, 1);
+    assert_eq!(options.max_connections, 256);
+    assert_eq!(options.idle_timeout, Duration::from_secs(300));
+    assert!(options.tcp_nodelay);
+}
+
+#[tokio::test]
+async fn zero_operation_timeout_is_rejected() {
     let node =
         NodePool::from_endpoints(["127.0.0.1:1".parse().unwrap()], NodePoolOptions::default())
             .unwrap();
@@ -173,8 +199,8 @@ fn zero_operation_timeout_is_rejected() {
 async fn read_timeout_discards_connection_and_releases_the_node_slot() {
     let (server, first_request_received) = TestServer::start_with_first_partial_response(70).await;
     let options = NodePoolOptions {
+        min_connections: 0,
         max_connections: 1,
-        max_idle_connections: 1,
         ..NodePoolOptions::default()
     };
     let node = NodePool::from_endpoints([server.address], options).unwrap();
@@ -196,35 +222,31 @@ async fn read_timeout_discards_connection_and_releases_the_node_slot() {
     assert_eq!(node.stats().total_connections, 1);
     assert_eq!(node.stats().checked_out_connections, 1);
 
-    let waiting_node = node.clone();
-    let waiting = tokio::spawn(async move { request(&waiting_node, &NO_KEY).await });
-    tokio::task::yield_now().await;
-    assert_eq!(node.stats().total_connections, 1);
+    let result = request(&node, &NO_KEY).await;
+    assert!(matches!(
+        result,
+        Err(CallError::Net(NetError::PoolExhausted {
+            max_connections: 1
+        }))
+    ));
 
     let first = first.await.unwrap();
     assert!(matches!(
         first,
         Err(CallError::Timeout { timeout }) if timeout == Duration::from_millis(100)
     ));
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("waiting request was not woken")
-            .unwrap()
-            .unwrap(),
-        70
-    );
+    assert_eq!(request(&node, &NO_KEY).await.unwrap(), 70);
     assert_eq!(server.accept_count(), 2);
     assert_eq!(node.stats().total_connections, 1);
     assert_eq!(node.stats().idle_connections, 1);
 }
 
 #[tokio::test]
-async fn operation_deadline_includes_waiting_for_a_node_connection() {
+async fn exhausted_pool_fails_without_invoking_the_operation() {
     let server = TestServer::start(71).await;
     let options = NodePoolOptions {
+        min_connections: 0,
         max_connections: 1,
-        max_idle_connections: 1,
         ..NodePoolOptions::default()
     };
     let node = NodePool::from_endpoints([server.address], options).unwrap();
@@ -246,7 +268,7 @@ async fn operation_deadline_includes_waiting_for_a_node_connection() {
 
     let called = Arc::new(AtomicBool::new(false));
     let operation_called = called.clone();
-    let client = TcpClient::new(node.clone(), Duration::from_millis(50)).unwrap();
+    let client = TcpClient::new(node.clone(), Duration::from_secs(1)).unwrap();
     let result: Result<(), CallError<io::Error>> = client
         .with_conn(&NO_KEY, move |_stream| {
             operation_called.store(true, Ordering::SeqCst);
@@ -254,7 +276,12 @@ async fn operation_deadline_includes_waiting_for_a_node_connection() {
         })
         .await;
 
-    assert!(matches!(result, Err(CallError::Timeout { .. })));
+    assert!(matches!(
+        result,
+        Err(CallError::Net(NetError::PoolExhausted {
+            max_connections: 1
+        }))
+    ));
     assert!(!called.load(Ordering::SeqCst));
     assert_eq!(node.stats().total_connections, 1);
     assert_eq!(node.stats().checked_out_connections, 1);
@@ -319,18 +346,39 @@ async fn cancellation_discards_a_checked_out_connection() {
 }
 
 #[tokio::test]
-async fn waiting_acquirer_is_woken_by_a_recycled_connection() {
+async fn default_min_connection_is_created_in_the_background() {
     let server = TestServer::start(10).await;
-    let options = NodePoolOptions {
-        max_connections: 1,
-        max_idle_connections: 1,
-        ..NodePoolOptions::default()
-    };
-    let node = NodePool::from_endpoints([server.address], options).unwrap();
+    let node = NodePool::from_endpoints([server.address], NodePoolOptions::default()).unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        node.stats().idle_connections == 1
+    })
+    .await;
+    assert_eq!(node.stats().total_connections, 1);
+    assert_eq!(server.accept_count(), 1);
+}
+
+#[tokio::test]
+async fn background_maintenance_reaps_idle_connections_but_preserves_minimum() {
+    let server = TestServer::start(13).await;
+    let node = NodePool::from_endpoints(
+        [server.address],
+        NodePoolOptions {
+            min_connections: 1,
+            max_connections: 2,
+            idle_timeout: Duration::from_millis(50),
+            ..NodePoolOptions::default()
+        },
+    )
+    .unwrap();
+    wait_until(Duration::from_secs(2), || {
+        node.stats().idle_connections == 1
+    })
+    .await;
+
     let first_node = node.clone();
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
-
     let first = tokio::spawn(async move {
         first_node
             .with_conn(&NO_KEY, move |_stream| {
@@ -342,17 +390,16 @@ async fn waiting_acquirer_is_woken_by_a_recycled_connection() {
             })
             .await
     });
-
     entered_rx.await.unwrap();
-    let second_node = node.clone();
-    let second = tokio::spawn(async move { request(&second_node, &NO_KEY).await });
-    tokio::task::yield_now().await;
-    assert_eq!(node.stats().total_connections, 1);
-
+    assert_eq!(request(&node, &NO_KEY).await.unwrap(), 13);
     release_tx.send(()).unwrap();
     first.await.unwrap().unwrap();
-    assert_eq!(second.await.unwrap().unwrap(), 10);
-    assert_eq!(server.accept_count(), 1);
+    assert_eq!(node.stats().idle_connections, 2);
+
+    wait_until(Duration::from_secs(2), || {
+        node.stats().total_connections == 1 && node.stats().idle_connections == 1
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -362,8 +409,16 @@ async fn endpoint_updates_stop_reusing_removed_addresses() {
     let endpoints = EndpointSet::new([first.address]);
     let node = NodePool::new(endpoints.clone(), NodePoolOptions::default()).unwrap();
 
+    wait_until(Duration::from_secs(2), || {
+        node.stats().idle_connections == 1
+    })
+    .await;
     assert_eq!(request(&node, &NO_KEY).await.unwrap(), 11);
     assert!(endpoints.replace([second.address]));
+    wait_until(Duration::from_secs(3), || {
+        second.accept_count() == 1 && node.stats().idle_connections == 1
+    })
+    .await;
     assert_eq!(request(&node, &NO_KEY).await.unwrap(), 12);
     assert_eq!(node.stats().total_connections, 1);
 }
