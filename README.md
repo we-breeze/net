@@ -1,92 +1,83 @@
 # net
 
+`net` 是 Breeze SDK 共用的、协议无关的异步 TCP 基础层。消费方通常将
+Cargo package 重命名为 `brz-net`，在 Rust 代码中通过 `brz_net` 使用。
 
-
-## Getting started
-
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
-
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
-
-## Add your files
-
-- [ ] [Create](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#create-a-file) or [upload](https://docs.gitlab.com/ee/user/project/repository/web_editor.html#upload-a-file) files
-- [ ] [Add files using the command line](https://docs.gitlab.com/ee/gitlab-basics/add-file.html#add-a-file-using-the-command-line) or push an existing Git repository with the following command:
-
-```
-cd existing_repo
-git remote add origin https://github.com/we-breeze/net.git
-git branch -M master
-git push -uf origin master
+```toml
+[dependencies]
+brz-net = { package = "net", git = "https://github.com/we-breeze/net.git" }
 ```
 
-## Integrate with your tools
+## 核心模型
 
-- [ ] [Set up project integrations](https://github.com/we-breeze/net/-/settings/integrations)
+- `BrzTcpStream`：持有一条物理连接，实现 Tokio `AsyncRead`、
+  `AsyncWrite`、`Unpin` 和 `Send`。
+- `NodePool`：管理一个逻辑节点的 endpoint 发现、建连、空闲连接和回收。
+- `Pool<C>`：在多个等价 `C` 之间按观测耗时负载均衡并快速隔离连续失败者。
+- `Sharded<C, R>`：使用 key 和 `ShardRouter` 选择一个 `C`。
+- `StreamProvider<K>`：以上组件共同实现的组合接口。
 
-## Collaborate with your team
+组合顺序就是执行顺序：
 
-- [ ] [Invite team members and collaborators](https://docs.gitlab.com/ee/user/project/members/)
-- [ ] [Create a new merge request](https://docs.gitlab.com/ee/user/project/merge_requests/creating_merge_requests.html)
-- [ ] [Automatically close issues from merge requests](https://docs.gitlab.com/ee/user/project/issues/managing_issues.html#closing-issues-automatically)
-- [ ] [Enable merge request approvals](https://docs.gitlab.com/ee/user/project/merge_requests/approvals/)
-- [ ] [Set auto-merge](https://docs.gitlab.com/ee/user/project/merge_requests/merge_when_pipeline_succeeds.html)
+```rust,ignore
+// Redis：key -> shard -> slave replica -> physical connection
+type RedisNet<R> = Sharded<Pool<NodePool>, R>;
 
-## Test and Deploy
+// MC：complete replica -> key -> shard -> physical connection
+type McNet<R> = Pool<Sharded<NodePool, R>>;
 
-Use the built-in continuous integration in GitLab.
+// 普通的多副本服务
+type MotanNet = Pool<NodePool>;
+```
 
-- [ ] [Get started with GitLab CI/CD](https://docs.gitlab.com/ee/ci/quick_start/index.html)
-- [ ] [Analyze your code for known vulnerabilities with Static Application Security Testing(SAST)](https://docs.gitlab.com/ee/user/application_security/sast/)
-- [ ] [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/ee/topics/autodevops/requirements.html)
-- [ ] [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/ee/user/clusters/agent/)
-- [ ] [Set up protected environments](https://docs.gitlab.com/ee/ci/environments/protected_environments.html)
+每个 `Sharded` 都持有自己的 router 和 shard 数量，因此 MC 的不同完整副本
+可以具有不同的分片数。
 
-***
+## 使用连接
 
-# Editing this README
+`with_conn` 是主要入口。回调成功时连接才会回收到原 `NodePool`；回调错误、
+Future 被取消、发生异步 I/O 错误或显式调用 `discard()` 时，连接都会关闭。
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thank you to [makeareadme.com](https://www.makeareadme.com/) for this template.
+```rust,ignore
+use brz_net::{NodePool, NodePoolOptions, StreamProvider};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-## Suggestions for a good README
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+let node = NodePool::from_endpoints(
+    ["127.0.0.1:11211".parse()?],
+    NodePoolOptions::default(),
+)?;
 
-## Name
-Choose a self-explaining name for your project.
+let value = node
+    .with_conn(&(), |stream| {
+        Box::pin(async move {
+            stream.write_all(b"version\r\n").await?;
+            let mut response = vec![0; 128];
+            let length = stream.read(&mut response).await?;
+            Ok::<_, std::io::Error>(response[..length].to_vec())
+        })
+    })
+    .await?;
+```
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+协议实现必须在返回 `Ok` 前完成一次完整的请求/响应交换，不能把留有未消费
+数据的连接标记为成功。
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+## 动态 endpoint
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+`EndpointSet` 可由 Vintage 等发现适配器更新；`DnsSource` 会定期重新解析多个
+`host:port`。新请求总是使用最新快照，已移除 endpoint 的空闲连接不会再复用。
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+## 第一版边界
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+第一版不内置 operation timeout。调用方可以暂时在最外层使用
+`tokio::time::timeout`；超时取消 `with_conn` Future 时，已借出的连接会自动丢弃。
+后续可以在不改变 `NodePool`、`Pool`、`Sharded` 组合接口的情况下增加统一超时
+装饰器。
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## 验证
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+```bash
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```

@@ -1,0 +1,15 @@
+[package]
+name = "net"
+version = "0.1.0"
+edition = "2024"
+description = "Protocol-agnostic async TCP routing, load balancing, and connection pooling for Breeze SDKs"
+license = "MIT"
+
+[dependencies]
+parking_lot = "0.12"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
