@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     fmt,
     net::SocketAddr,
     sync::{
@@ -9,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::Mutex;
+use crossbeam_queue::ArrayQueue;
 use tokio::{net::TcpStream, runtime::Handle};
 
 use crate::{
@@ -54,31 +53,29 @@ pub struct NodePoolStats {
 ///
 /// The endpoint source may contain multiple addresses (for example, DNS A
 /// records), but all pooled connections belong to the same logical node.
-#[derive(Clone)]
-pub struct NodePool {
-    inner: Arc<NodePoolInner>,
+pub struct NodePool<S = EndpointSet> {
+    source: S,
+    core: Arc<NodePoolCore>,
 }
 
-pub(crate) struct NodePoolInner {
+impl<S: Clone> Clone for NodePool<S> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+            core: self.core.clone(),
+        }
+    }
+}
+
+pub(crate) struct NodePoolCore {
     maintenance_id: u64,
     runtime: Handle,
-    source: Arc<dyn EndpointSource>,
-    state: Mutex<ConnectionState>,
+    idle: ArrayQueue<IdleConnection>,
+    total: AtomicUsize,
+    connecting: AtomicUsize,
+    maintenance_owned: AtomicUsize,
     next_endpoint: AtomicUsize,
     options: NodePoolOptions,
-}
-
-#[derive(Default)]
-struct ConnectionState {
-    idle: VecDeque<IdleConnection>,
-    checked_out: usize,
-    connecting: usize,
-}
-
-impl ConnectionState {
-    fn total(&self) -> usize {
-        self.idle.len() + self.checked_out + self.connecting
-    }
 }
 
 struct IdleConnection {
@@ -86,32 +83,81 @@ struct IdleConnection {
     since: Instant,
 }
 
-impl NodePool {
-    pub fn new(source: impl EndpointSource + 'static, options: NodePoolOptions) -> Result<Self> {
+impl<S: EndpointSource> NodePool<S> {
+    pub fn new(source: S, options: NodePoolOptions) -> Result<Self> {
         validate_options(options)?;
         let runtime = Handle::try_current().map_err(|_| {
             NetError::InvalidConfig("NodePool must be created inside a Tokio runtime".into())
         })?;
-        let source: Arc<dyn EndpointSource> = Arc::new(source);
-        let inner = Arc::new(NodePoolInner {
+        let core = Arc::new(NodePoolCore {
             maintenance_id: NEXT_MAINTENANCE_ID.fetch_add(1, Ordering::Relaxed),
             runtime,
-            source,
-            state: Mutex::new(ConnectionState::default()),
+            idle: ArrayQueue::new(options.max_connections),
+            total: AtomicUsize::new(0),
+            connecting: AtomicUsize::new(0),
+            maintenance_owned: AtomicUsize::new(0),
             next_endpoint: AtomicUsize::new(0),
             options,
         });
-        maintenance::register(&inner)?;
-        Ok(Self { inner })
+        maintenance::register(&core, source.endpoint_set().clone())?;
+        Ok(Self { source, core })
     }
 
+    pub fn stats(&self) -> NodePoolStats {
+        self.core.stats()
+    }
+
+    async fn acquire_stream(&self) -> Result<BrzTcpStream> {
+        let endpoints = self.source.snapshot();
+        if endpoints.is_empty() {
+            return Err(NetError::NoEndpoints);
+        }
+
+        if let Some(connection) = self.core.pop_idle() {
+            return Ok(BrzTcpStream::new(connection, Arc::downgrade(&self.core)));
+        }
+        if self
+            .core
+            .reserve_connection(self.core.options.max_connections)
+        {
+            return self.connect_stream(endpoints).await;
+        }
+
+        // Close the race with a concurrent recycle after the first empty pop.
+        if let Some(connection) = self.core.pop_idle() {
+            return Ok(BrzTcpStream::new(connection, Arc::downgrade(&self.core)));
+        }
+        // Close the equivalent race with background removal freeing capacity.
+        if self
+            .core
+            .reserve_connection(self.core.options.max_connections)
+        {
+            return self.connect_stream(endpoints).await;
+        }
+
+        Err(NetError::PoolExhausted {
+            max_connections: self.core.options.max_connections,
+        })
+    }
+
+    async fn connect_stream(&self, endpoints: Arc<[SocketAddr]>) -> Result<BrzTcpStream> {
+        let mut reservation = ConnectionReservation::new(self.core.clone());
+        let connection = self.core.connect(endpoints).await?;
+        reservation.commit();
+        Ok(BrzTcpStream::new(connection, Arc::downgrade(&self.core)))
+    }
+}
+
+impl NodePool<EndpointSet> {
     pub fn from_endpoints(
         endpoints: impl IntoIterator<Item = SocketAddr>,
         options: NodePoolOptions,
     ) -> Result<Self> {
         Self::new(EndpointSet::new(endpoints), options)
     }
+}
 
+impl NodePool<DnsSource> {
     pub async fn from_dns(
         names: impl IntoIterator<Item = impl Into<String>>,
         dns_options: DnsOptions,
@@ -132,76 +178,67 @@ impl NodePool {
             pool_options,
         )
     }
-
-    pub fn stats(&self) -> NodePoolStats {
-        let state = self.inner.state.lock();
-        NodePoolStats {
-            total_connections: state.total(),
-            idle_connections: state.idle.len(),
-            checked_out_connections: state.checked_out,
-            connecting_connections: state.connecting,
-        }
-    }
-
-    async fn acquire_stream(&self) -> Result<BrzTcpStream> {
-        let endpoints = self.inner.source.snapshot();
-        let action = {
-            let mut state = self.inner.state.lock();
-            if endpoints.is_empty() {
-                AcquireAction::NoEndpoints
-            } else if let Some(idle) = state.idle.pop_back() {
-                state.checked_out += 1;
-                AcquireAction::Reuse(idle.connection)
-            } else if state.total() < self.inner.options.max_connections {
-                state.connecting += 1;
-                AcquireAction::Connect(endpoints)
-            } else {
-                AcquireAction::Exhausted
-            }
-        };
-
-        match action {
-            AcquireAction::NoEndpoints => Err(NetError::NoEndpoints),
-            AcquireAction::Reuse(connection) => {
-                Ok(BrzTcpStream::new(connection, Arc::downgrade(&self.inner)))
-            }
-            AcquireAction::Connect(endpoints) => {
-                let mut reservation = ConnectionReservation::new(self.inner.clone());
-                let connection = self.inner.connect(endpoints).await?;
-                reservation.commit();
-                Ok(BrzTcpStream::new(connection, Arc::downgrade(&self.inner)))
-            }
-            AcquireAction::Exhausted => Err(NetError::PoolExhausted {
-                max_connections: self.inner.options.max_connections,
-            }),
-        }
-    }
 }
 
-impl fmt::Debug for NodePool {
+impl<S: EndpointSource> fmt::Debug for NodePool<S> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("NodePool")
-            .field("endpoints", &self.inner.source.snapshot())
-            .field("options", &self.inner.options)
+            .field("endpoints", &self.source.snapshot())
+            .field("options", &self.core.options)
             .field("stats", &self.stats())
             .finish()
     }
 }
 
-impl<K: ?Sized + Sync> StreamProvider<K> for NodePool {
+impl<K: ?Sized + Sync, S: EndpointSource> StreamProvider<K> for NodePool<S> {
     fn acquire<'a>(&'a self, _key: &'a K) -> BoxFuture<'a, Result<BrzTcpStream>> {
         Box::pin(async move { self.acquire_stream().await })
     }
 }
 
-impl NodePoolInner {
+impl NodePoolCore {
     pub(crate) fn maintenance_id(&self) -> u64 {
         self.maintenance_id
     }
 
     pub(crate) fn runtime(&self) -> Handle {
         self.runtime.clone()
+    }
+
+    fn stats(&self) -> NodePoolStats {
+        let total = self.total.load(Ordering::Acquire);
+        let idle = self.idle.len();
+        let connecting = self.connecting.load(Ordering::Acquire);
+        let maintenance_owned = self.maintenance_owned.load(Ordering::Acquire);
+        NodePoolStats {
+            total_connections: total,
+            idle_connections: idle,
+            checked_out_connections: total
+                .saturating_sub(idle)
+                .saturating_sub(connecting)
+                .saturating_sub(maintenance_owned),
+            connecting_connections: connecting,
+        }
+    }
+
+    #[inline]
+    fn pop_idle(&self) -> Option<ManagedConnection> {
+        self.idle.pop().map(|idle| idle.connection)
+    }
+
+    #[inline]
+    fn reserve_connection(&self, limit: usize) -> bool {
+        let reserved = self
+            .total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                (total < limit).then_some(total + 1)
+            })
+            .is_ok();
+        if reserved {
+            self.connecting.fetch_add(1, Ordering::Relaxed);
+        }
+        reserved
     }
 
     async fn connect(&self, endpoints: Arc<[SocketAddr]>) -> Result<ManagedConnection> {
@@ -231,86 +268,109 @@ impl NodePoolInner {
     }
 
     pub(crate) fn recycle(&self, connection: ManagedConnection) {
-        let mut state = self.state.lock();
-        debug_assert!(state.checked_out > 0);
-        state.checked_out = state.checked_out.saturating_sub(1);
-        state.idle.push_back(IdleConnection {
+        self.push_idle(IdleConnection {
             connection,
             since: Instant::now(),
         });
     }
 
     pub(crate) fn discard_connection(&self, connection: ManagedConnection) {
+        self.release_total();
         drop(connection);
-        let mut state = self.state.lock();
-        debug_assert!(state.checked_out > 0);
-        state.checked_out = state.checked_out.saturating_sub(1);
     }
 
-    fn finish_request_connection(&self) {
-        let mut state = self.state.lock();
-        debug_assert!(state.connecting > 0);
-        state.connecting = state.connecting.saturating_sub(1);
-        state.checked_out += 1;
+    fn push_idle(&self, idle: IdleConnection) -> bool {
+        match self.idle.push(idle) {
+            Ok(()) => true,
+            Err(idle) => {
+                tracing::error!(
+                    maintenance_id = self.maintenance_id,
+                    max_connections = self.options.max_connections,
+                    "idle connection queue reached an impossible full state; discarding connection"
+                );
+                self.release_total();
+                drop(idle);
+                false
+            }
+        }
     }
 
-    fn release_request_reservation(&self) {
-        let mut state = self.state.lock();
-        debug_assert!(state.connecting > 0);
-        state.connecting = state.connecting.saturating_sub(1);
+    fn finish_connection(&self) {
+        self.release_connecting();
     }
 
-    /// Perform housekeeping without making request acquisition pay its scan cost.
-    /// A contended state lock is skipped to keep hot-path contention bounded.
-    pub(crate) fn maintenance_tick(&self) -> bool {
-        let endpoints = self.source.snapshot();
-        let Some(mut state) = self.state.try_lock() else {
-            return false;
-        };
+    fn release_reservation(&self) {
+        self.release_connecting();
+        self.release_total();
+    }
 
-        state
-            .idle
-            .retain(|idle| endpoints.contains(&idle.connection.endpoint));
+    fn release_connecting(&self) {
+        let previous = self.connecting.fetch_sub(1, Ordering::Relaxed);
+        debug_assert!(previous > 0);
+    }
 
-        let idle_needed_for_min = self
-            .options
-            .min_connections
-            .saturating_sub(state.checked_out + state.connecting);
+    fn release_total(&self) {
+        let result = self
+            .total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                total.checked_sub(1)
+            });
+        debug_assert!(result.is_ok());
+    }
+
+    fn release_expired_above_min(&self) -> bool {
+        self.total
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |total| {
+                (total > self.options.min_connections).then_some(total - 1)
+            })
+            .is_ok()
+    }
+
+    /// Perform endpoint and idle-timeout cleanup outside request acquisition.
+    pub(crate) fn maintenance_tick(&self, source: &EndpointSet) -> bool {
+        let endpoints = source.snapshot();
+        let scan_count = self.idle.len();
         let now = Instant::now();
-        while state.idle.len() > idle_needed_for_min
-            && state
-                .idle
-                .front()
-                .is_some_and(|idle| now.duration_since(idle.since) >= self.options.idle_timeout)
-        {
-            state.idle.pop_front();
+
+        for _ in 0..scan_count {
+            let Some(idle) = self.idle.pop() else {
+                break;
+            };
+            self.maintenance_owned.fetch_add(1, Ordering::Relaxed);
+
+            let active = endpoints.contains(&idle.connection.endpoint);
+            let expired = now.duration_since(idle.since) >= self.options.idle_timeout;
+            if !active {
+                self.release_total();
+                drop(idle);
+            } else if expired && self.release_expired_above_min() {
+                drop(idle);
+            } else {
+                self.push_idle(idle);
+            }
+
+            let previous = self.maintenance_owned.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0);
         }
 
-        !endpoints.is_empty() && state.total() < self.options.min_connections
+        !endpoints.is_empty() && self.total.load(Ordering::Acquire) < self.options.min_connections
     }
 
     pub(crate) fn reserve_background_connection(
         self: &Arc<Self>,
+        source: EndpointSet,
         completion: std::sync::mpsc::Sender<maintenance::Command>,
     ) -> Option<(Arc<[SocketAddr]>, BackgroundReservation)> {
-        let endpoints = self.source.snapshot();
-        if endpoints.is_empty() {
+        let endpoints = source.snapshot();
+        if endpoints.is_empty() || !self.reserve_connection(self.options.min_connections) {
             return None;
         }
-
-        let mut state = self.state.try_lock()?;
-        if state.total() >= self.options.min_connections
-            || state.total() >= self.options.max_connections
-        {
-            return None;
-        }
-        state.connecting += 1;
-        drop(state);
 
         Some((
             endpoints,
             BackgroundReservation {
                 owner: self.clone(),
+                source,
                 completion,
                 active: true,
             },
@@ -318,20 +378,13 @@ impl NodePoolInner {
     }
 }
 
-enum AcquireAction {
-    NoEndpoints,
-    Reuse(ManagedConnection),
-    Connect(Arc<[SocketAddr]>),
-    Exhausted,
-}
-
 struct ConnectionReservation {
-    owner: Arc<NodePoolInner>,
+    owner: Arc<NodePoolCore>,
     active: bool,
 }
 
 impl ConnectionReservation {
-    fn new(owner: Arc<NodePoolInner>) -> Self {
+    fn new(owner: Arc<NodePoolCore>) -> Self {
         Self {
             owner,
             active: true,
@@ -339,7 +392,7 @@ impl ConnectionReservation {
     }
 
     fn commit(&mut self) {
-        self.owner.finish_request_connection();
+        self.owner.finish_connection();
         self.active = false;
     }
 }
@@ -347,13 +400,14 @@ impl ConnectionReservation {
 impl Drop for ConnectionReservation {
     fn drop(&mut self) {
         if self.active {
-            self.owner.release_request_reservation();
+            self.owner.release_reservation();
         }
     }
 }
 
 pub(crate) struct BackgroundReservation {
-    owner: Arc<NodePoolInner>,
+    owner: Arc<NodePoolCore>,
+    source: EndpointSet,
     completion: std::sync::mpsc::Sender<maintenance::Command>,
     active: bool,
 }
@@ -371,30 +425,25 @@ impl BackgroundReservation {
                 None
             }
         };
+        self.owner.release_connecting();
+
         let mut retry_now = false;
-        let mut connection = connection;
-
-        {
-            let current_endpoints = self.owner.source.snapshot();
-            let mut state = self.owner.state.lock();
-            debug_assert!(state.connecting > 0);
-            state.connecting = state.connecting.saturating_sub(1);
-
-            if connection
-                .as_ref()
-                .is_some_and(|value| current_endpoints.contains(&value.endpoint))
-            {
-                state.idle.push_back(IdleConnection {
-                    connection: connection.take().expect("connection was checked above"),
+        if let Some(connection) = connection {
+            if self.source.snapshot().contains(&connection.endpoint) {
+                retry_now = !self.owner.push_idle(IdleConnection {
+                    connection,
                     since: Instant::now(),
-                });
-                retry_now = state.total() < self.owner.options.min_connections;
-            } else if connection.is_some() {
+                }) || self.owner.total.load(Ordering::Acquire)
+                    < self.owner.options.min_connections;
+            } else {
+                self.owner.release_total();
+                drop(connection);
                 retry_now = true;
             }
+        } else {
+            self.owner.release_total();
         }
 
-        drop(connection);
         self.active = false;
         let _ = self.completion.send(maintenance::Command::Finished {
             id: self.owner.maintenance_id,
@@ -409,11 +458,7 @@ impl Drop for BackgroundReservation {
             return;
         }
 
-        {
-            let mut state = self.owner.state.lock();
-            debug_assert!(state.connecting > 0);
-            state.connecting = state.connecting.saturating_sub(1);
-        }
+        self.owner.release_reservation();
         let _ = self.completion.send(maintenance::Command::Finished {
             id: self.owner.maintenance_id,
             retry_now: false,

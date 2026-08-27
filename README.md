@@ -12,7 +12,8 @@ brz-net = { package = "net", git = "https://github.com/we-breeze/net.git" }
 
 - `BrzTcpStream`：持有一条物理连接，实现 Tokio `AsyncRead`、
   `AsyncWrite`、`Unpin` 和 `Send`。
-- `NodePool`：管理一个逻辑节点的 endpoint 发现、建连、空闲连接和回收。
+- `NodePool<S>`：管理一个逻辑节点的 endpoint 发现、建连、空闲连接和回收；
+  `S: EndpointSource` 使用静态分发，不在请求路径保存 `dyn` trait object。
 - `Pool<C>`：在多个等价 `C` 之间按累计请求耗时 quota 轮转。
 - `Sharded<C, R>`：使用 key 和 `ShardRouter` 选择一个 `C`。
 - `StreamProvider<K>`：以上组件共同实现的组合接口。
@@ -71,6 +72,11 @@ let pool = Pool::with_options(
 容量已满则立即返回 `NetError::PoolExhausted`，不会排队等待。调用方可以据此重试、
 选择其他副本或快速失败。
 
+连接获取和成功归还的热路径使用有界 MPMC 队列及原子容量计数，不获取互斥锁：
+借用已有连接只执行队列 `pop`，归还只执行队列 `push`，新建连接通过原子操作预占
+总连接名额。`total_connections` 是严格容量边界；`NodePoolStats` 的各字段是分别读取
+的瞬时观测值，并发过程中不保证来自同一个时刻。
+
 ## 使用连接
 
 `TcpClient::with_conn` 是主要入口。回调成功时连接才会回收到原 `NodePool`；回调
@@ -114,7 +120,7 @@ let value = client
 ## 连接维护
 
 请求路径不扫描过期连接，也不检查每条空闲连接是否仍属于最新 DNS/endpoint 集合。
-进程级共享维护器每秒扫描一次所有存活的 `NodePool`，在后台完成：
+进程级共享维护器每秒扫描一次所有存活的 `NodePool`，通过同一无锁队列在后台完成：
 
 - 清除已经从 endpoint 集合移除的空闲连接；
 - 清除超过 `idle_timeout` 的空闲连接，但保留 `min_connections`；

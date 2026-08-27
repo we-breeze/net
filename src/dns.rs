@@ -209,8 +209,8 @@ impl std::fmt::Debug for DnsSource {
 }
 
 impl EndpointSource for DnsSource {
-    fn snapshot(&self) -> Arc<[SocketAddr]> {
-        DnsSource::snapshot(self)
+    fn endpoint_set(&self) -> &EndpointSet {
+        &self.endpoints
     }
 }
 

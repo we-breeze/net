@@ -11,7 +11,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use crate::node::NodePoolInner;
+use crate::node::NodePoolCore;
 
 pub(crate) struct ManagedConnection {
     pub(crate) io: TcpStream,
@@ -29,7 +29,7 @@ pub(crate) trait StreamObserver: Send {
 /// succeeds; all other drops close it.
 pub struct BrzTcpStream {
     connection: Option<ManagedConnection>,
-    owner: Weak<NodePoolInner>,
+    owner: Weak<NodePoolCore>,
     observers: Vec<Box<dyn StreamObserver>>,
     reusable: bool,
     discarded: bool,
@@ -37,7 +37,7 @@ pub struct BrzTcpStream {
 }
 
 impl BrzTcpStream {
-    pub(crate) fn new(connection: ManagedConnection, owner: Weak<NodePoolInner>) -> Self {
+    pub(crate) fn new(connection: ManagedConnection, owner: Weak<NodePoolCore>) -> Self {
         Self {
             connection: Some(connection),
             owner,

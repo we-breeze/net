@@ -4,11 +4,16 @@ use arc_swap::ArcSwap;
 
 /// A dynamically replaceable set of addresses for one logical node.
 pub trait EndpointSource: Send + Sync {
+    /// Return the concrete copy-on-write endpoint storage.
+    fn endpoint_set(&self) -> &EndpointSet;
+
     /// Load the current immutable endpoint snapshot.
     ///
     /// Implementations publish snapshots with copy-on-write semantics, so this
     /// method is suitable for the connection-acquisition hot path.
-    fn snapshot(&self) -> Arc<[SocketAddr]>;
+    fn snapshot(&self) -> Arc<[SocketAddr]> {
+        self.endpoint_set().snapshot()
+    }
 }
 
 /// An endpoint source that can be updated by discovery adapters such as Vintage.
@@ -60,8 +65,8 @@ impl std::fmt::Debug for EndpointSet {
 }
 
 impl EndpointSource for EndpointSet {
-    fn snapshot(&self) -> Arc<[SocketAddr]> {
-        EndpointSet::snapshot(self)
+    fn endpoint_set(&self) -> &EndpointSet {
+        self
     }
 }
 

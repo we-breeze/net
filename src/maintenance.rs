@@ -8,14 +8,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{NetError, Result, node::NodePoolInner};
+use crate::{EndpointSet, NetError, Result, node::NodePoolCore};
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_BACKGROUND_CONNECTS: usize = 1;
 
 pub(crate) enum Command {
-    Register(Weak<NodePoolInner>),
+    Register(MaintenanceNode),
     Finished { id: u64, retry_now: bool },
+}
+
+pub(crate) struct MaintenanceNode {
+    core: Weak<NodePoolCore>,
+    endpoints: EndpointSet,
 }
 
 #[derive(Clone)]
@@ -25,11 +30,14 @@ struct Maintainer {
 
 static MAINTAINER: OnceLock<std::result::Result<Maintainer, String>> = OnceLock::new();
 
-pub(crate) fn register(node: &Arc<NodePoolInner>) -> Result<()> {
+pub(crate) fn register(core: &Arc<NodePoolCore>, endpoints: EndpointSet) -> Result<()> {
     let maintainer = shared()?;
     maintainer
         .sender
-        .send(Command::Register(Arc::downgrade(node)))
+        .send(Command::Register(MaintenanceNode {
+            core: Arc::downgrade(core),
+            endpoints,
+        }))
         .map_err(|_| NetError::PoolMaintainerStopped)
 }
 
@@ -51,7 +59,7 @@ fn start() -> std::result::Result<Maintainer, String> {
 }
 
 fn run(receiver: Receiver<Command>, sender: Sender<Command>) {
-    let mut nodes = HashMap::<u64, Weak<NodePoolInner>>::new();
+    let mut nodes = HashMap::<u64, MaintenanceNode>::new();
     let mut ready = VecDeque::new();
     let mut queued = HashSet::new();
     let mut in_flight = 0_usize;
@@ -76,21 +84,21 @@ fn run(receiver: Receiver<Command>, sender: Sender<Command>) {
 
 fn handle_command(
     command: Command,
-    nodes: &mut HashMap<u64, Weak<NodePoolInner>>,
+    nodes: &mut HashMap<u64, MaintenanceNode>,
     ready: &mut VecDeque<u64>,
     queued: &mut HashSet<u64>,
     in_flight: &mut usize,
 ) {
     match command {
         Command::Register(node) => {
-            let Some(node) = node.upgrade() else {
+            let Some(core) = node.core.upgrade() else {
                 return;
             };
-            let id = node.maintenance_id();
-            nodes.insert(id, Arc::downgrade(&node));
-            if node.maintenance_tick() {
+            let id = core.maintenance_id();
+            if core.maintenance_tick(&node.endpoints) {
                 enqueue(id, ready, queued);
             }
+            nodes.insert(id, node);
         }
         Command::Finished { id, retry_now } => {
             *in_flight = in_flight.saturating_sub(1);
@@ -102,16 +110,16 @@ fn handle_command(
 }
 
 fn scan_nodes(
-    nodes: &mut HashMap<u64, Weak<NodePoolInner>>,
+    nodes: &mut HashMap<u64, MaintenanceNode>,
     ready: &mut VecDeque<u64>,
     queued: &mut HashSet<u64>,
 ) {
     nodes.retain(|id, node| {
-        let Some(node) = node.upgrade() else {
+        let Some(core) = node.core.upgrade() else {
             queued.remove(id);
             return false;
         };
-        if node.maintenance_tick() {
+        if core.maintenance_tick(&node.endpoints) {
             enqueue(*id, ready, queued);
         }
         true
@@ -125,7 +133,7 @@ fn enqueue(id: u64, ready: &mut VecDeque<u64>, queued: &mut HashSet<u64>) {
 }
 
 fn dispatch(
-    nodes: &HashMap<u64, Weak<NodePoolInner>>,
+    nodes: &HashMap<u64, MaintenanceNode>,
     ready: &mut VecDeque<u64>,
     queued: &mut HashSet<u64>,
     in_flight: &mut usize,
@@ -137,15 +145,19 @@ fn dispatch(
         };
         queued.remove(&id);
 
-        let Some(node) = nodes.get(&id).and_then(Weak::upgrade) else {
+        let Some(node) = nodes.get(&id) else {
             continue;
         };
-        let Some((endpoints, reservation)) = node.reserve_background_connection(sender.clone())
+        let Some(core) = node.core.upgrade() else {
+            continue;
+        };
+        let Some((endpoints, reservation)) =
+            core.reserve_background_connection(node.endpoints.clone(), sender.clone())
         else {
             continue;
         };
 
         *in_flight += 1;
-        node.runtime().spawn(reservation.connect(endpoints));
+        core.runtime().spawn(reservation.connect(endpoints));
     }
 }

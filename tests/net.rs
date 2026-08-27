@@ -10,13 +10,13 @@ use std::{
 };
 
 use net::{
-    CallError, EndpointSet, NetError, NodePool, NodePoolOptions, Pool, QuotaBalancerOptions,
-    Sharded, StreamProvider, TcpClient,
+    CallError, EndpointSet, EndpointSource, NetError, NodePool, NodePoolOptions, Pool,
+    QuotaBalancerOptions, Sharded, StreamProvider, TcpClient,
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpListener,
-    sync::oneshot,
+    sync::{Barrier, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -128,6 +128,17 @@ fn node(address: SocketAddr) -> NodePool {
         },
     )
     .unwrap()
+}
+
+#[derive(Clone)]
+struct TestEndpointSource {
+    endpoints: EndpointSet,
+}
+
+impl EndpointSource for TestEndpointSource {
+    fn endpoint_set(&self) -> &EndpointSet {
+        &self.endpoints
+    }
 }
 
 async fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) {
@@ -290,6 +301,96 @@ async fn exhausted_pool_fails_without_invoking_the_operation() {
     first.await.unwrap().unwrap();
     assert_eq!(node.stats().total_connections, 1);
     assert_eq!(node.stats().idle_connections, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_acquire_never_exceeds_the_atomic_connection_limit() {
+    const MAX_CONNECTIONS: usize = 8;
+    const REQUESTS: usize = 64;
+
+    let server = TestServer::start(72).await;
+    let node = NodePool::from_endpoints(
+        [server.address],
+        NodePoolOptions {
+            min_connections: 0,
+            max_connections: MAX_CONNECTIONS,
+            ..NodePoolOptions::default()
+        },
+    )
+    .unwrap();
+    let start = Arc::new(Barrier::new(REQUESTS + 1));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let (release, release_rx) = watch::channel(false);
+    let mut requests = Vec::with_capacity(REQUESTS);
+
+    for _ in 0..REQUESTS {
+        let node = node.clone();
+        let start = start.clone();
+        let entered = entered.clone();
+        let mut release_rx = release_rx.clone();
+        requests.push(tokio::spawn(async move {
+            start.wait().await;
+            node.with_conn(&NO_KEY, move |_stream| {
+                Box::pin(async move {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    release_rx.changed().await.unwrap();
+                    Ok::<_, io::Error>(())
+                })
+            })
+            .await
+        }));
+    }
+
+    start.wait().await;
+    wait_until(Duration::from_secs(2), || {
+        entered.load(Ordering::SeqCst) == MAX_CONNECTIONS
+    })
+    .await;
+    wait_until(Duration::from_secs(2), || {
+        server.accept_count() == MAX_CONNECTIONS
+    })
+    .await;
+
+    assert_eq!(node.stats().total_connections, MAX_CONNECTIONS);
+    assert_eq!(node.stats().checked_out_connections, MAX_CONNECTIONS);
+    assert_eq!(entered.load(Ordering::SeqCst), MAX_CONNECTIONS);
+
+    release.send(true).unwrap();
+    let mut succeeded = 0;
+    let mut exhausted = 0;
+    for request in requests {
+        match request.await.unwrap() {
+            Ok(()) => succeeded += 1,
+            Err(CallError::Net(NetError::PoolExhausted {
+                max_connections: MAX_CONNECTIONS,
+            })) => exhausted += 1,
+            result => panic!("unexpected request result: {result:?}"),
+        }
+    }
+
+    assert_eq!(succeeded, MAX_CONNECTIONS);
+    assert_eq!(exhausted, REQUESTS - MAX_CONNECTIONS);
+    assert_eq!(node.stats().total_connections, MAX_CONNECTIONS);
+    assert_eq!(node.stats().idle_connections, MAX_CONNECTIONS);
+}
+
+#[tokio::test]
+async fn node_pool_statically_dispatches_a_concrete_endpoint_source() {
+    let server = TestServer::start(73).await;
+    let source = TestEndpointSource {
+        endpoints: EndpointSet::new([server.address]),
+    };
+    let node: NodePool<TestEndpointSource> = NodePool::new(
+        source,
+        NodePoolOptions {
+            min_connections: 0,
+            ..NodePoolOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(request(&node, &NO_KEY).await.unwrap(), 73);
+    assert_eq!(server.accept_count(), 1);
 }
 
 #[tokio::test]
