@@ -16,6 +16,7 @@ brz-net = { package = "net", git = "https://github.com/we-breeze/net.git" }
 - `Pool<C>`：在多个等价 `C` 之间按观测耗时负载均衡并快速隔离连续失败者。
 - `Sharded<C, R>`：使用 key 和 `ShardRouter` 选择一个 `C`。
 - `StreamProvider<K>`：以上组件共同实现的组合接口。
+- `TcpClient<P>`：包裹最终组合，在最外层实施统一 operation deadline。
 
 组合顺序就是执行顺序：
 
@@ -35,19 +36,23 @@ type MotanNet = Pool<NodePool>;
 
 ## 使用连接
 
-`with_conn` 是主要入口。回调成功时连接才会回收到原 `NodePool`；回调错误、
-Future 被取消、发生异步 I/O 错误或显式调用 `discard()` 时，连接都会关闭。
+`TcpClient::with_conn` 是主要入口。回调成功时连接才会回收到原 `NodePool`；回调
+错误、Future 被取消、发生异步 I/O 错误、operation 超时或显式调用 `discard()`
+时，连接都会关闭。
 
 ```rust,ignore
-use brz_net::{NodePool, NodePoolOptions, StreamProvider};
+use std::time::Duration;
+
+use brz_net::{NodePool, NodePoolOptions, TcpClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 let node = NodePool::from_endpoints(
     ["127.0.0.1:11211".parse()?],
     NodePoolOptions::default(),
 )?;
+let client = TcpClient::new(node, Duration::from_millis(400))?;
 
-let value = node
+let value = client
     .with_conn(&(), |stream| {
         Box::pin(async move {
             stream.write_all(b"version\r\n").await?;
@@ -61,6 +66,10 @@ let value = node
 
 协议实现必须在返回 `Ok` 前完成一次完整的请求/响应交换，不能把留有未消费
 数据的连接标记为成功。
+
+每次调用只创建一个 Tokio `timeout_at`，使用同一个绝对 deadline 覆盖等待连接池、
+建连、写请求和读取完整响应。超时取消 Future 后，可能已经部分读写的物理连接会被
+丢弃，并自动归还 `NodePool` 的连接计数。
 
 ## 动态 endpoint
 
@@ -93,13 +102,6 @@ let node = NodePool::from_dns_with_resolver(
 )
 .await?;
 ```
-
-## 第一版边界
-
-第一版不内置 operation timeout。调用方可以暂时在最外层使用
-`tokio::time::timeout`；超时取消 `with_conn` Future 时，已借出的连接会自动丢弃。
-后续可以在不改变 `NodePool`、`Pool`、`Sharded` 组合接口的情况下增加统一超时
-装饰器。
 
 ## 验证
 

@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr};
+use std::{io, net::SocketAddr, time::Duration};
 
 /// Errors produced by the network layer itself.
 #[derive(Debug, thiserror::Error)]
@@ -48,6 +48,9 @@ pub enum CallError<E> {
     #[error(transparent)]
     Net(#[from] NetError),
 
+    #[error("network operation timed out after {timeout:?}")]
+    Timeout { timeout: Duration },
+
     #[error("protocol operation failed")]
     Operation(E),
 }
@@ -56,7 +59,7 @@ impl<E> CallError<E> {
     pub fn into_operation(self) -> Option<E> {
         match self {
             Self::Operation(error) => Some(error),
-            Self::Net(_) => None,
+            Self::Net(_) | Self::Timeout { .. } => None,
         }
     }
 }
