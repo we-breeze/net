@@ -47,7 +47,7 @@ pub struct DnsResolverOptions {
 impl Default for DnsResolverOptions {
     fn default() -> Self {
         Self {
-            max_concurrent_lookups: 32,
+            max_concurrent_lookups: 1,
             scheduler_tick: Duration::from_secs(1),
             lookup_timeout: Duration::from_secs(5),
         }
@@ -894,6 +894,11 @@ mod tests {
         })
         .await
         .expect("condition was not met");
+    }
+
+    #[test]
+    fn default_resolver_uses_one_lookup_slot() {
+        assert_eq!(DnsResolverOptions::default().max_concurrent_lookups, 1);
     }
 
     #[tokio::test(start_paused = true)]

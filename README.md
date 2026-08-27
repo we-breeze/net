@@ -71,16 +71,18 @@ let value = node
 `DnsSource` 只接受 IPv4 hostname，默认复用进程级 `DnsResolver`。解析器按 hostname
 去重（端口由订阅者各自保留），不会为每个 `NodePool` 创建定时任务：新注册域名在
 下一个 1 秒调度 tick 执行首次解析，之后才按 `refresh_interval` 分散刷新。查询并发
-默认限制为 32；解析失败保留最后一次成功结果，只有地址集合实际变化时才发布新
+默认限制为 1，用单个 lookup task 平滑万级域名解析对系统 resolver 的压力；解析
+失败保留最后一次成功结果，只有地址集合实际变化时才发布新
 快照。
 
-大量域名也可以显式共享一个带自定义并发上限的解析器：
+通常不需要调整并发；确认系统能够承受且需要加快解析时，可以显式共享一个带自定义
+上限的解析器：
 
 ```rust,ignore
 use brz_net::{DnsOptions, DnsResolver, DnsResolverOptions, NodePool, NodePoolOptions};
 
 let resolver = DnsResolver::new(DnsResolverOptions {
-    max_concurrent_lookups: 16,
+    max_concurrent_lookups: 4,
     ..DnsResolverOptions::default()
 })?;
 let node = NodePool::from_dns_with_resolver(
