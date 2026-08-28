@@ -1,6 +1,6 @@
 use std::{fmt, sync::Arc};
 
-use crate::{BoxFuture, BrzTcpStream, NetError, Result, StreamProvider};
+use crate::{NetError, RequestTarget, Result, SessionError};
 
 pub trait ShardRouter<K: ?Sized>: Send + Sync {
     fn route(&self, key: &K, shard_count: usize) -> usize;
@@ -38,6 +38,18 @@ impl<C, R> Sharded<C, R> {
     pub fn shard_count(&self) -> usize {
         self.shards.len()
     }
+
+    #[inline]
+    pub fn get<K: ?Sized>(&self, key: &K) -> Result<&C>
+    where
+        R: ShardRouter<K>,
+    {
+        let index = self.router.route(key, self.shards.len());
+        self.shards.get(index).ok_or(NetError::InvalidShard {
+            index,
+            shard_count: self.shards.len(),
+        })
+    }
 }
 
 impl<C: fmt::Debug, R> fmt::Debug for Sharded<C, R> {
@@ -49,22 +61,26 @@ impl<C: fmt::Debug, R> fmt::Debug for Sharded<C, R> {
     }
 }
 
-impl<K, C, R> StreamProvider<K> for Sharded<C, R>
+impl<K, C, R> RequestTarget<K> for Sharded<C, R>
 where
-    K: ?Sized + Sync,
-    C: StreamProvider<K> + Send + Sync,
-    R: ShardRouter<K>,
+    K: ?Sized,
+    C: RequestTarget<K>,
+    R: ShardRouter<K> + 'static,
 {
-    fn acquire<'a>(&'a self, key: &'a K) -> BoxFuture<'a, Result<BrzTcpStream>> {
-        Box::pin(async move {
-            let index = self.router.route(key, self.shards.len());
-            let Some(shard) = self.shards.get(index) else {
-                return Err(NetError::InvalidShard {
-                    index,
-                    shard_count: self.shards.len(),
-                });
-            };
-            shard.acquire(key).await
-        })
+    type Request = C::Request;
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = C::Future;
+
+    #[inline]
+    fn request_for(
+        &self,
+        key: &K,
+        request: Self::Request,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>> {
+        let shard = self
+            .get(key)
+            .map_err(|error| SessionError::Routing(Arc::new(error)))?;
+        shard.request_for(key, request)
     }
 }

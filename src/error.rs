@@ -1,4 +1,4 @@
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io, sync::Arc, time::Duration};
 
 /// Errors produced by the network layer itself.
 #[derive(Debug, thiserror::Error)]
@@ -28,41 +28,55 @@ pub enum NetError {
     #[error("shared DNS resolver task stopped")]
     DnsResolverStopped,
 
-    #[error("failed to connect to {endpoint}: {source}")]
-    Connect {
-        endpoint: SocketAddr,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("node connection pool is exhausted (max {max_connections})")]
-    PoolExhausted { max_connections: usize },
-
-    #[error("shared node-pool maintainer stopped")]
-    PoolMaintainerStopped,
+    #[error("session node must be created inside a Tokio runtime")]
+    NoRuntime,
 }
 
-/// The result type used by provider construction and connection acquisition.
+/// The result type used while constructing network components.
 pub type Result<T> = std::result::Result<T, NetError>;
 
-/// Separates network-layer failures from errors returned by a protocol operation.
+/// Failure of one request submitted to a single-connection session.
+///
+/// I/O and protocol errors are reference counted so one connection failure can
+/// complete every in-flight request without cloning the underlying error.
 #[derive(Debug, thiserror::Error)]
-pub enum CallError<E> {
-    #[error(transparent)]
-    Net(#[from] NetError),
+pub enum SessionError<E> {
+    #[error("session request capacity is exhausted")]
+    Busy,
 
-    #[error("network operation timed out after {timeout:?}")]
+    #[error("session is not connected")]
+    Unavailable,
+
+    #[error("session request timed out after {timeout:?}")]
     Timeout { timeout: Duration },
 
-    #[error("protocol operation failed")]
-    Operation(E),
+    #[error("session connection closed")]
+    Closed,
+
+    #[error("connection I/O failed: {0}")]
+    Io(Arc<io::Error>),
+
+    #[error("protocol failed: {0}")]
+    Protocol(Arc<E>),
+
+    #[error("request routing failed: {0}")]
+    Routing(Arc<NetError>),
+
+    #[error("received a FIFO response without a pending request")]
+    UnexpectedResponse,
 }
 
-impl<E> CallError<E> {
-    pub fn into_operation(self) -> Option<E> {
+impl<E> Clone for SessionError<E> {
+    fn clone(&self) -> Self {
         match self {
-            Self::Operation(error) => Some(error),
-            Self::Net(_) | Self::Timeout { .. } => None,
+            Self::Busy => Self::Busy,
+            Self::Unavailable => Self::Unavailable,
+            Self::Timeout { timeout } => Self::Timeout { timeout: *timeout },
+            Self::Closed => Self::Closed,
+            Self::Io(error) => Self::Io(error.clone()),
+            Self::Protocol(error) => Self::Protocol(error.clone()),
+            Self::Routing(error) => Self::Routing(error.clone()),
+            Self::UnexpectedResponse => Self::UnexpectedResponse,
         }
     }
 }

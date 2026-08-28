@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -6,7 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{NetError, Result, stream::StreamObserver};
+use crate::{
+    NetError, Node, RequestTarget, RequestToken, ResponseFuture, Result, SessionError,
+    SessionProtocol,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct QuotaBalancerOptions {
@@ -148,17 +152,167 @@ impl QuotaGuard {
     }
 }
 
-impl StreamObserver for QuotaGuard {
-    fn succeeded(self: Box<Self>) {
-        (*self).finish(true);
-    }
-}
-
 impl Drop for QuotaGuard {
     fn drop(&mut self) {
         if !self.finished {
             self.record(self.started.elapsed(), false);
         }
+    }
+}
+
+/// Equivalent physical nodes selected by consumed request-time quota.
+#[derive(Clone)]
+pub struct ReplicaSet<N> {
+    replicas: Arc<[N]>,
+    balancer: QuotaBalancer,
+}
+
+impl<N> ReplicaSet<N> {
+    pub fn new(replicas: impl IntoIterator<Item = N>) -> Result<Self> {
+        Self::with_options(replicas, QuotaBalancerOptions::default())
+    }
+
+    pub fn with_options(
+        replicas: impl IntoIterator<Item = N>,
+        options: QuotaBalancerOptions,
+    ) -> Result<Self> {
+        let mut replicas = replicas.into_iter().collect::<Vec<_>>();
+        if replicas.is_empty() {
+            return Err(NetError::NoReplicas);
+        }
+        shuffle(&mut replicas);
+        Ok(Self {
+            balancer: QuotaBalancer::new(replicas.len(), options)?,
+            replicas: replicas.into(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.replicas.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.replicas.is_empty()
+    }
+
+    pub fn snapshots(&self) -> Vec<ReplicaSnapshot> {
+        self.balancer.snapshots()
+    }
+}
+
+impl<P: SessionProtocol> ReplicaSet<Node<P>> {
+    /// Select one node and submit immediately. Queue-full and disconnected
+    /// errors consume the configured failure penalty through `QuotaGuard::drop`.
+    #[inline]
+    pub fn request(
+        &self,
+        request: P::Request,
+    ) -> std::result::Result<NodeReplicaResponseFuture<P>, SessionError<P::Error>> {
+        let guard = self.balancer.select();
+        let index = guard.index();
+        let response = self.replicas[index].request(request)?;
+        Ok(ReplicaResponseFuture {
+            response,
+            guard: Some(guard),
+            output: PhantomData,
+        })
+    }
+}
+
+impl<N: std::fmt::Debug> std::fmt::Debug for ReplicaSet<N> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReplicaSet")
+            .field("replicas", &self.replicas)
+            .field("snapshots", &self.snapshots())
+            .finish()
+    }
+}
+
+type NodeReplicaResult<P> = std::result::Result<
+    <P as SessionProtocol>::Response,
+    SessionError<<P as SessionProtocol>::Error>,
+>;
+
+/// Response future returned by the direct `ReplicaSet<Node<P>>::request` API.
+pub type NodeReplicaResponseFuture<P> = ReplicaResponseFuture<
+    ResponseFuture<NodeReplicaResult<P>>,
+    <P as SessionProtocol>::Response,
+    <P as SessionProtocol>::Error,
+>;
+
+/// Response Future that charges elapsed time to the selected replica.
+pub struct ReplicaResponseFuture<F, T, E> {
+    response: F,
+    guard: Option<QuotaGuard>,
+    output: PhantomData<fn() -> (T, E)>,
+}
+
+impl<T, E> ReplicaResponseFuture<ResponseFuture<std::result::Result<T, SessionError<E>>>, T, E> {
+    pub fn request_token(&self) -> RequestToken {
+        self.response.request_token()
+    }
+}
+
+impl<F: Unpin, T, E> Unpin for ReplicaResponseFuture<F, T, E> {}
+
+impl<F, T, E> std::future::Future for ReplicaResponseFuture<F, T, E>
+where
+    F: std::future::Future<Output = std::result::Result<T, SessionError<E>>> + Unpin,
+{
+    type Output = std::result::Result<T, SessionError<E>>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        match std::pin::Pin::new(&mut self.response).poll(context) {
+            std::task::Poll::Ready(result) => {
+                self.guard
+                    .take()
+                    .expect("quota guard is present until response completion")
+                    .finish(result.is_ok());
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl<K, C> RequestTarget<K> for ReplicaSet<C>
+where
+    K: ?Sized,
+    C: RequestTarget<K>,
+{
+    type Request = C::Request;
+    type Response = C::Response;
+    type Error = C::Error;
+    type Future = ReplicaResponseFuture<C::Future, C::Response, C::Error>;
+
+    #[inline]
+    fn request_for(
+        &self,
+        key: &K,
+        request: Self::Request,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>> {
+        let guard = self.balancer.select();
+        let index = guard.index();
+        let response = self.replicas[index].request_for(key, request)?;
+        Ok(ReplicaResponseFuture {
+            response,
+            guard: Some(guard),
+            output: PhantomData,
+        })
+    }
+}
+
+fn shuffle<T>(values: &mut [T]) {
+    use std::{collections::hash_map::RandomState, hash::BuildHasher};
+
+    let random = RandomState::new();
+    for upper in (1..values.len()).rev() {
+        let index = random.hash_one(upper) as usize % (upper + 1);
+        values.swap(upper, index);
     }
 }
 

@@ -2,12 +2,13 @@
 name = "net"
 version = "0.1.0"
 edition = "2024"
-description = "Protocol-agnostic async TCP routing, load balancing, and connection pooling for Breeze SDKs"
+description = "High-performance single-connection async transport for Breeze SDKs"
 license = "MIT"
 
 [dependencies]
+atomic-waker = "1"
 arc-swap = "1"
-crossbeam-queue = "0.3"
+bytes = "1"
 parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }

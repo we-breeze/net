@@ -1,24 +1,24 @@
-//! Protocol-agnostic async TCP primitives for Breeze SDK clients.
+//! High-performance single-connection transports for Breeze SDK clients.
 
 mod balance;
-mod client;
+mod completion;
 mod dns;
 mod error;
-mod maintenance;
-mod node;
-mod pool;
-mod provider;
+mod protocol;
+mod session;
 mod sharded;
 mod source;
-mod stream;
+mod target;
 
-pub use balance::{QuotaBalancerOptions, ReplicaSnapshot};
-pub use client::TcpClient;
+pub use balance::{
+    NodeReplicaResponseFuture, QuotaBalancerOptions, ReplicaResponseFuture, ReplicaSet,
+    ReplicaSnapshot,
+};
+pub use completion::{MAX_IN_FLIGHT, RequestToken, ResponseFuture};
 pub use dns::{DnsOptions, DnsResolver, DnsResolverOptions, DnsSource};
-pub use error::{CallError, NetError, Result};
-pub use node::{NodePool, NodePoolOptions, NodePoolStats};
-pub use pool::Pool;
-pub use provider::{BoxFuture, OperationFuture, StreamProvider};
+pub use error::{NetError, Result, SessionError};
+pub use protocol::{Correlation, DecodedResponse, HandshakeStatus, SessionProtocol};
+pub use session::{Node, NodeOptions, NodeStats};
 pub use sharded::{ShardRouter, Sharded};
 pub use source::{EndpointSet, EndpointSource};
-pub use stream::BrzTcpStream;
+pub use target::RequestTarget;
