@@ -1,34 +1,67 @@
 use std::{
     collections::VecDeque,
     fmt,
+    future::poll_fn,
+    io::IoSlice,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    task::{Context, Poll, ready},
     time::Duration,
 };
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
+    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpStream, tcp::ReadHalf},
     runtime::Handle,
     sync::mpsc,
-    time::{self, Instant},
+    time::{self, Instant, MissedTickBehavior},
 };
 
 use crate::{
     Correlation, HandshakeStatus, NetError, RequestTarget, RequestToken, ResponseFuture, Result,
-    SessionError, SessionProtocol,
+    RxBuffer, SessionError, SessionProtocol,
     completion::{CompletionTable, MAX_IN_FLIGHT},
+    rx::DEFAULT_MAX_RX_BUFFER_CAPACITY,
 };
 
-const DEFAULT_BUFFER_CAPACITY: usize = 8 * 1024;
+const DEFAULT_READ_BUFFER_CAPACITY: usize = 2 * 1024;
+const RX_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_WRITE_VECTORS: usize = 4;
 
 type ResponseResult<P> = std::result::Result<
     <P as SessionProtocol>::Response,
     SessionError<<P as SessionProtocol>::Error>,
 >;
+
+/// Aborts a response slot unless its request has been published to the driver.
+/// This also covers unwinding from a caller-provided request builder.
+struct ResponseReservation<T> {
+    future: Option<ResponseFuture<T>>,
+}
+
+impl<T> ResponseReservation<T> {
+    fn new(future: ResponseFuture<T>) -> Self {
+        Self {
+            future: Some(future),
+        }
+    }
+
+    fn publish(mut self) -> ResponseFuture<T> {
+        self.future.take().expect("response reservation is present")
+    }
+}
+
+impl<T> Drop for ResponseReservation<T> {
+    fn drop(&mut self) {
+        if let Some(future) = self.future.take() {
+            future.abort();
+        }
+    }
+}
 
 /// Runtime policy for one physical node and its one persistent connection.
 #[derive(Clone, Copy, Debug)]
@@ -40,7 +73,7 @@ pub struct NodeOptions {
     pub tcp_nodelay: bool,
     pub write_batch: usize,
     pub read_buffer_capacity: usize,
-    pub write_buffer_capacity: usize,
+    pub max_read_buffer_capacity: usize,
 }
 
 impl Default for NodeOptions {
@@ -52,8 +85,8 @@ impl Default for NodeOptions {
             max_reconnect_delay: Duration::from_secs(2),
             tcp_nodelay: true,
             write_batch: 4,
-            read_buffer_capacity: DEFAULT_BUFFER_CAPACITY,
-            write_buffer_capacity: DEFAULT_BUFFER_CAPACITY,
+            read_buffer_capacity: DEFAULT_READ_BUFFER_CAPACITY,
+            max_read_buffer_capacity: DEFAULT_MAX_RX_BUFFER_CAPACITY,
         }
     }
 }
@@ -80,14 +113,23 @@ impl NodeOptions {
                 "max_reconnect_delay must be at least reconnect_delay".into(),
             ));
         }
-        if self.write_batch == 0 {
+        if !(1..=MAX_WRITE_VECTORS).contains(&self.write_batch) {
+            return Err(NetError::InvalidConfig(format!(
+                "write_batch must be between 1 and {MAX_WRITE_VECTORS}"
+            )));
+        }
+        if self.read_buffer_capacity == 0 {
             return Err(NetError::InvalidConfig(
-                "write_batch must be greater than zero".into(),
+                "read_buffer_capacity must be greater than zero".into(),
             ));
         }
-        if self.read_buffer_capacity == 0 || self.write_buffer_capacity == 0 {
+        if !self.read_buffer_capacity.is_power_of_two()
+            || !self.max_read_buffer_capacity.is_power_of_two()
+            || self.max_read_buffer_capacity < self.read_buffer_capacity
+        {
             return Err(NetError::InvalidConfig(
-                "session buffer capacities must be greater than zero".into(),
+                "receive buffer capacities must be powers of two and max must be at least initial"
+                    .into(),
             ));
         }
         Ok(self)
@@ -163,6 +205,23 @@ impl<P: SessionProtocol> Node<P> {
         &self,
         request: P::Request,
     ) -> std::result::Result<ResponseFuture<ResponseResult<P>>, SessionError<P::Error>> {
+        self.request_with(|| request)
+    }
+
+    /// Reserve bounded request capacity before constructing the request.
+    ///
+    /// `build` runs synchronously only after this node is connected and its
+    /// MPSC queue has capacity. This lets protocol clients postpone their final
+    /// serialization until the request has passed the fail-fast admission
+    /// checks.
+    #[inline]
+    pub fn request_with<F>(
+        &self,
+        build: F,
+    ) -> std::result::Result<ResponseFuture<ResponseResult<P>>, SessionError<P::Error>>
+    where
+        F: FnOnce() -> P::Request,
+    {
         if !self.inner.shared.connected.load(Ordering::Acquire) {
             return Err(SessionError::Unavailable);
         }
@@ -172,12 +231,20 @@ impl<P: SessionProtocol> Node<P> {
             .connection_generation
             .load(Ordering::Acquire);
 
+        let permit = match self.inner.requests.try_reserve() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(())) => return Err(SessionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(SessionError::Closed),
+        };
+
         let Some((token, future)) = self.inner.shared.completions.reserve() else {
             return Err(SessionError::Busy);
         };
+        let future = ResponseReservation::new(future);
 
         // Close the race with a disconnect between the first availability
-        // check and slot reservation.
+        // check and queue reservation. In particular, do not serialize a
+        // request for a connection generation that can no longer send it.
         if !self.inner.shared.connected.load(Ordering::Acquire)
             || self
                 .inner
@@ -186,7 +253,21 @@ impl<P: SessionProtocol> Node<P> {
                 .load(Ordering::Acquire)
                 != connection_generation
         {
-            future.abort();
+            return Err(SessionError::Unavailable);
+        }
+
+        let request = build();
+
+        // Reservation and request construction are lock-free, but a disconnect
+        // may still win between them. Never publish that frame to a new stream.
+        if !self.inner.shared.connected.load(Ordering::Acquire)
+            || self
+                .inner
+                .shared
+                .connection_generation
+                .load(Ordering::Acquire)
+                != connection_generation
+        {
             return Err(SessionError::Unavailable);
         }
 
@@ -195,17 +276,8 @@ impl<P: SessionProtocol> Node<P> {
             connection_generation,
             request,
         };
-        match self.inner.requests.try_send(envelope) {
-            Ok(()) => Ok(future),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                future.abort();
-                Err(SessionError::Busy)
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                future.abort();
-                Err(SessionError::Closed)
-            }
-        }
+        permit.send(envelope);
+        Ok(future.publish())
     }
 
     #[inline]
@@ -278,14 +350,89 @@ enum DriveError<E> {
     UnexpectedResponse,
 }
 
+struct WriteQueue<F> {
+    frames: VecDeque<F>,
+    front_offset: usize,
+    max_vectors: usize,
+}
+
+impl<F: AsRef<[u8]>> WriteQueue<F> {
+    fn new(max_vectors: usize) -> Self {
+        let max_vectors = max_vectors.clamp(1, MAX_WRITE_VECTORS);
+        Self {
+            frames: VecDeque::with_capacity(max_vectors),
+            front_offset: 0,
+            max_vectors,
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[inline]
+    fn push(&mut self, frame: F) -> bool {
+        if frame.as_ref().is_empty() {
+            return false;
+        }
+        self.frames.push_back(frame);
+        true
+    }
+
+    fn poll_write<W: AsyncWrite + Unpin>(
+        &mut self,
+        cx: &mut Context<'_>,
+        writer: &mut W,
+    ) -> Poll<std::io::Result<usize>> {
+        let count = self.frames.len().min(self.max_vectors);
+        let written = if writer.is_write_vectored() && count > 1 {
+            let mut slices = [IoSlice::new(&[]); MAX_WRITE_VECTORS];
+            for (index, frame) in self.frames.iter().take(count).enumerate() {
+                let bytes = frame.as_ref();
+                slices[index] = if index == 0 {
+                    IoSlice::new(&bytes[self.front_offset..])
+                } else {
+                    IoSlice::new(bytes)
+                };
+            }
+            ready!(Pin::new(&mut *writer).poll_write_vectored(cx, &slices[..count]))?
+        } else {
+            let frame = self.frames.front().expect("write queue is not empty");
+            ready!(Pin::new(&mut *writer).poll_write(cx, &frame.as_ref()[self.front_offset..]))?
+        };
+        self.advance(written);
+        Poll::Ready(Ok(written))
+    }
+
+    fn advance(&mut self, mut written: usize) {
+        while written > 0 {
+            let frame = self.frames.front().expect("socket wrote queued bytes");
+            let remaining = frame.as_ref().len() - self.front_offset;
+            if written < remaining {
+                self.front_offset += written;
+                return;
+            }
+            written -= remaining;
+            self.frames.pop_front();
+            self.front_offset = 0;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.front_offset = 0;
+    }
+}
+
 struct ConnectionDriver<P: SessionProtocol> {
     endpoint: std::net::SocketAddr,
     protocol: P,
     options: NodeOptions,
     requests: mpsc::Receiver<Envelope<P::Request>>,
     shared: Arc<Shared<P>>,
-    read_buffer: BytesMut,
-    write_buffer: BytesMut,
+    read_buffer: RxBuffer,
+    writes: WriteQueue<P::Frame>,
     batch: VecDeque<Envelope<P::Request>>,
 }
 
@@ -303,8 +450,11 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
             options,
             requests,
             shared,
-            read_buffer: BytesMut::with_capacity(options.read_buffer_capacity),
-            write_buffer: BytesMut::with_capacity(options.write_buffer_capacity),
+            read_buffer: RxBuffer::new(
+                options.read_buffer_capacity,
+                options.max_read_buffer_capacity,
+            ),
+            writes: WriteQueue::new(options.write_batch),
             batch: VecDeque::with_capacity(options.write_batch),
         }
     }
@@ -325,8 +475,7 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
             };
 
             self.protocol.reset();
-            self.read_buffer.clear();
-            self.write_buffer.clear();
+            self.read_buffer.reset();
             if let Err(error) = self.handshake(&mut stream).await {
                 self.log_establish_error(&error);
                 let _ = stream.shutdown().await;
@@ -362,6 +511,7 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
             };
 
             self.fail_pending(&mut pending, error.clone());
+            self.writes.clear();
             self.fail_queued(error);
             let _ = stream.shutdown().await;
 
@@ -392,19 +542,21 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
         &mut self,
         stream: &mut TcpStream,
     ) -> std::result::Result<(), DriveError<P::Error>> {
+        let mut write_buffer = BytesMut::new();
         let mut status = self
             .protocol
-            .begin_handshake(&mut self.write_buffer)
+            .begin_handshake(&mut write_buffer)
             .map_err(DriveError::Protocol)?;
-        if status == HandshakeStatus::Ready && self.write_buffer.is_empty() {
+        if status == HandshakeStatus::Ready && write_buffer.is_empty() {
             return Ok(());
         }
 
+        let mut read_buffer = BytesMut::new();
         let (mut reader, mut writer) = stream.split();
         let timeout = time::sleep(self.options.connect_timeout);
         tokio::pin!(timeout);
         loop {
-            if status == HandshakeStatus::Ready && self.write_buffer.is_empty() {
+            if status == HandshakeStatus::Ready && write_buffer.is_empty() {
                 return Ok(());
             }
 
@@ -413,23 +565,23 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
 
                 _ = &mut timeout => return Err(DriveError::Timeout),
 
-                read = reader.read_buf(&mut self.read_buffer), if status == HandshakeStatus::Pending => {
+                read = reader.read_buf(&mut read_buffer), if status == HandshakeStatus::Pending => {
                     match read {
                         Ok(0) => return Err(DriveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))),
                         Ok(_) => {
                             status = self
                                 .protocol
-                                .decode_handshake(&mut self.read_buffer, &mut self.write_buffer)
+                                .decode_handshake(&mut read_buffer, &mut write_buffer)
                                 .map_err(DriveError::Protocol)?;
                         }
                         Err(error) => return Err(DriveError::Io(error)),
                     }
                 }
 
-                write = writer.write(&self.write_buffer), if !self.write_buffer.is_empty() => {
+                write = writer.write(&write_buffer), if !write_buffer.is_empty() => {
                     match write {
                         Ok(0) => return Err(DriveError::Io(std::io::Error::from(std::io::ErrorKind::WriteZero))),
-                        Ok(length) => self.write_buffer.advance(length),
+                        Ok(length) => write_buffer.advance(length),
                         Err(error) => return Err(DriveError::Io(error)),
                     }
                 }
@@ -462,9 +614,11 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
         let (mut reader, mut writer) = stream.split();
         let timeout = time::sleep_until(far_future());
         tokio::pin!(timeout);
+        let first_maintenance = Instant::now() + maintenance_jitter(self.endpoint);
+        let mut maintenance = time::interval_at(first_maintenance, RX_MAINTENANCE_INTERVAL);
+        maintenance.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
-            prune_resolved::<P>(&self.shared.completions, pending);
             if let Some(deadline) = pending.front().map(|pending| pending.deadline)
                 && timeout.deadline() != deadline
             {
@@ -478,22 +632,33 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                     return DriveError::Timeout;
                 }
 
-                read = reader.read_buf(&mut self.read_buffer), if !pending.is_empty() => {
+                read = read_socket(&mut reader, &mut self.read_buffer, !pending.is_empty()) => {
                     match read {
-                        Ok(0) => return DriveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-                        Ok(_) => {
+                        Ok(SocketRead::Response(outcome)) => {
                             if let Err(error) = self.decode_responses(pending) {
                                 return error;
                             }
+                            if self.read_buffer.is_full()
+                                && let Err(error) = self.read_buffer.reserve(1)
+                            {
+                                return DriveError::Io(invalid_data(error));
+                            }
+                            if outcome == DrainOutcome::Eof {
+                                return DriveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                            }
                         }
+                        Ok(SocketRead::IdleEof) => {
+                            return DriveError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                        }
+                        Ok(SocketRead::IdleData) => return DriveError::UnexpectedResponse,
                         Err(error) => return DriveError::Io(error),
                     }
                 }
 
-                write = writer.write(&self.write_buffer), if !self.write_buffer.is_empty() => {
+                write = poll_fn(|cx| self.writes.poll_write(cx, &mut writer)), if !self.writes.is_empty() => {
                     match write {
                         Ok(0) => return DriveError::Io(std::io::Error::from(std::io::ErrorKind::WriteZero)),
-                        Ok(length) => self.write_buffer.advance(length),
+                        Ok(_) => {}
                         Err(error) => return DriveError::Io(error),
                     }
                 }
@@ -513,6 +678,10 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                     self.encode_batch(pending);
                 }
 
+                _ = maintenance.tick() => {
+                    self.read_buffer.shrink();
+                }
+
             }
         }
     }
@@ -527,17 +696,20 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                     .complete(envelope.token, Err(SessionError::Unavailable));
                 continue;
             }
-            let original_length = self.write_buffer.len();
-            match self
-                .protocol
-                .encode(&envelope.request, envelope.token, &mut self.write_buffer)
-            {
-                Ok(()) => pending.push_back(Pending {
-                    token: envelope.token,
-                    deadline: Instant::now() + self.options.request_timeout,
-                }),
+            match self.protocol.encode(envelope.request, envelope.token) {
+                Ok(frame) => {
+                    if !self.writes.push(frame) {
+                        self.shared
+                            .completions
+                            .complete(envelope.token, Err(SessionError::EmptyRequestFrame));
+                        continue;
+                    }
+                    pending.push_back(Pending {
+                        token: envelope.token,
+                        deadline: Instant::now() + self.options.request_timeout,
+                    });
+                }
                 Err(error) => {
-                    self.write_buffer.truncate(original_length);
                     self.shared
                         .completions
                         .complete(envelope.token, Err(SessionError::Protocol(Arc::new(error))));
@@ -561,7 +733,6 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
 
             match decoded.correlation {
                 Correlation::Fifo => {
-                    prune_resolved::<P>(&self.shared.completions, pending);
                     let Some(request) = pending.pop_front() else {
                         return Err(DriveError::UnexpectedResponse);
                     };
@@ -570,6 +741,12 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                         .complete(request.token, Ok(decoded.response));
                 }
                 Correlation::Tagged(request_id) => {
+                    if let Some(index) = pending
+                        .iter()
+                        .position(|pending| pending.token == request_id)
+                    {
+                        pending.remove(index);
+                    }
                     // A false result is a timed-out, cancelled, duplicate, or
                     // otherwise late response and is intentionally ignored.
                     self.shared
@@ -615,22 +792,261 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
     }
 }
 
-fn prune_resolved<P: SessionProtocol>(
-    completions: &CompletionTable<ResponseResult<P>>,
-    pending: &mut VecDeque<Pending>,
-) {
-    while pending
-        .front()
-        .is_some_and(|request| !completions.is_driver_pending(request.token))
-    {
-        pending.pop_front();
-    }
-}
-
 fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(365 * 24 * 60 * 60)
 }
 
+/// Spread connection-local maintenance across one interval. This is computed
+/// once per connection and avoids a burst when DNS publishes many endpoints
+/// together.
+fn maintenance_jitter(endpoint: std::net::SocketAddr) -> Duration {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = FNV_OFFSET;
+    let mut mix = |byte: u8| {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    };
+    match endpoint.ip() {
+        std::net::IpAddr::V4(ip) => {
+            mix(4);
+            for byte in ip.octets() {
+                mix(byte);
+            }
+        }
+        std::net::IpAddr::V6(ip) => {
+            mix(6);
+            for byte in ip.octets() {
+                mix(byte);
+            }
+        }
+    }
+    for byte in endpoint.port().to_be_bytes() {
+        mix(byte);
+    }
+
+    let interval_millis = RX_MAINTENANCE_INTERVAL.as_millis() as u64;
+    Duration::from_millis(hash % interval_millis)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainOutcome {
+    Drained,
+    Full,
+    Eof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocketRead {
+    Response(DrainOutcome),
+    IdleEof,
+    IdleData,
+}
+
+async fn read_socket(
+    reader: &mut ReadHalf<'_>,
+    buffer: &mut RxBuffer,
+    response_pending: bool,
+) -> std::io::Result<SocketRead> {
+    if response_pending {
+        return drain_socket(reader, buffer).await.map(SocketRead::Response);
+    }
+
+    wait_idle_socket(reader).await
+}
+
+/// Keep an idle connection registered with the runtime reactor without
+/// allocating the protocol receive ring. FIN/RST wakes this future immediately;
+/// any payload is invalid because there is no request awaiting a response.
+async fn wait_idle_socket(reader: &ReadHalf<'_>) -> std::io::Result<SocketRead> {
+    let mut byte = [0_u8; 1];
+    loop {
+        reader.readable().await?;
+        match reader.try_read(&mut byte) {
+            Ok(0) => return Ok(SocketRead::IdleEof),
+            Ok(_) => return Ok(SocketRead::IdleData),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Wait for one readable event, then consume everything currently queued by
+/// the kernel. A full ring returns control to the protocol so a decoded length
+/// prefix can reserve the final frame size before reading resumes.
+async fn drain_socket(
+    reader: &mut ReadHalf<'_>,
+    buffer: &mut RxBuffer,
+) -> std::io::Result<DrainOutcome> {
+    buffer.prepare_read().map_err(invalid_data)?;
+    if buffer.remaining_mut() == 0 {
+        return Ok(DrainOutcome::Full);
+    }
+
+    let first = reader.read_buf(buffer).await?;
+    if first == 0 {
+        return Ok(DrainOutcome::Eof);
+    }
+    loop {
+        if buffer.remaining_mut() == 0 {
+            return Ok(DrainOutcome::Full);
+        }
+        match reader.try_read_buf(buffer) {
+            Ok(0) => return Ok(DrainOutcome::Eof),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(DrainOutcome::Drained);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn invalid_data(error: impl std::error::Error + Send + Sync + 'static) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+}
+
 fn next_delay(current: Duration, maximum: Duration) -> Duration {
     current.saturating_mul(2).min(maximum)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::IoSlice,
+        pin::Pin,
+        task::{Context, Poll, Waker},
+    };
+
+    use tokio::io::AsyncWrite;
+
+    use super::{
+        MAX_WRITE_VECTORS, NodeOptions, RX_MAINTENANCE_INTERVAL, WriteQueue, maintenance_jitter,
+    };
+
+    #[derive(Default)]
+    struct CountingWriter {
+        direct_calls: usize,
+        vectored_calls: usize,
+        maximum_write: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.direct_calls += 1;
+            Poll::Ready(Ok(bytes.len().min(self.maximum_write)))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            slices: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_calls += 1;
+            let length = slices.iter().map(|slice| slice.len()).sum::<usize>();
+            Poll::Ready(Ok(length.min(self.maximum_write)))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn one_frame_uses_direct_write_and_multiple_frames_use_writev() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = CountingWriter {
+            maximum_write: usize::MAX,
+            ..CountingWriter::default()
+        };
+        let mut writes = WriteQueue::new(MAX_WRITE_VECTORS);
+
+        assert!(writes.push(&b"one"[..]));
+        assert!(matches!(
+            writes.poll_write(&mut cx, &mut writer),
+            Poll::Ready(Ok(3))
+        ));
+        assert_eq!(writer.direct_calls, 1);
+        assert_eq!(writer.vectored_calls, 0);
+
+        assert!(writes.push(&b"two"[..]));
+        assert!(writes.push(&b"three"[..]));
+        assert!(matches!(
+            writes.poll_write(&mut cx, &mut writer),
+            Poll::Ready(Ok(8))
+        ));
+        assert_eq!(writer.direct_calls, 1);
+        assert_eq!(writer.vectored_calls, 1);
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn partial_write_preserves_the_remaining_frame_offset() {
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut writer = CountingWriter {
+            maximum_write: 4,
+            ..CountingWriter::default()
+        };
+        let mut writes = WriteQueue::new(MAX_WRITE_VECTORS);
+        assert!(writes.push(&b"abc"[..]));
+        assert!(writes.push(&b"def"[..]));
+
+        assert!(matches!(
+            writes.poll_write(&mut cx, &mut writer),
+            Poll::Ready(Ok(4))
+        ));
+        assert_eq!(writer.vectored_calls, 1);
+        assert_eq!(writes.frames.len(), 1);
+        assert_eq!(writes.front_offset, 1);
+
+        assert!(matches!(
+            writes.poll_write(&mut cx, &mut writer),
+            Poll::Ready(Ok(2))
+        ));
+        assert_eq!(writer.direct_calls, 1);
+        assert!(writes.is_empty());
+    }
+
+    #[test]
+    fn defaults_use_a_two_kib_receive_ring_and_four_frame_write_batch() {
+        let options = NodeOptions::default();
+
+        assert_eq!(options.read_buffer_capacity, 2 * 1024);
+        assert_eq!(options.write_batch, MAX_WRITE_VECTORS);
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn write_batch_is_bounded_by_the_stack_iovec_array() {
+        let options = NodeOptions {
+            write_batch: MAX_WRITE_VECTORS + 1,
+            ..NodeOptions::default()
+        };
+
+        assert!(options.validate().is_err());
+    }
+
+    #[test]
+    fn maintenance_jitter_is_stable_and_bounded() {
+        let first = "127.0.0.1:6379".parse().unwrap();
+        let second = "127.0.0.2:6379".parse().unwrap();
+
+        assert_eq!(maintenance_jitter(first), maintenance_jitter(first));
+        assert!(maintenance_jitter(first) < RX_MAINTENANCE_INTERVAL);
+        assert!(maintenance_jitter(second) < RX_MAINTENANCE_INTERVAL);
+        assert_ne!(maintenance_jitter(first), maintenance_jitter(second));
+    }
 }

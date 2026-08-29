@@ -205,12 +205,6 @@ impl<T> CompletionTable<T> {
         true
     }
 
-    pub(crate) fn is_driver_pending(&self, token: RequestToken) -> bool {
-        let slot = &self.slots[token.index()];
-        slot.generation.load(Ordering::Acquire) == token.generation()
-            && slot.state.load(Ordering::Acquire) & (OCCUPIED | DRIVER_DONE) == OCCUPIED
-    }
-
     pub(crate) fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
     }

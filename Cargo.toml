@@ -9,6 +9,7 @@ license = "MIT"
 atomic-waker = "1"
 arc-swap = "1"
 bytes = "1"
+brz-ds = { package = "brz-ds", version = "0.0.2", default-features = false }
 parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
@@ -16,3 +17,9 @@ tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

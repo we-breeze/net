@@ -217,6 +217,27 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
             output: PhantomData,
         })
     }
+
+    /// Select one node, reserve its bounded queue capacity, and only then
+    /// construct the request. This keeps serialization and arena allocation
+    /// off the fail-fast overload path.
+    #[inline]
+    pub fn request_with<F>(
+        &self,
+        build: F,
+    ) -> std::result::Result<NodeReplicaResponseFuture<P>, SessionError<P::Error>>
+    where
+        F: FnOnce() -> P::Request,
+    {
+        let guard = self.balancer.select();
+        let index = guard.index();
+        let response = self.replicas[index].request_with(build)?;
+        Ok(ReplicaResponseFuture {
+            response,
+            guard: Some(guard),
+            output: PhantomData,
+        })
+    }
 }
 
 impl<N: std::fmt::Debug> std::fmt::Debug for ReplicaSet<N> {

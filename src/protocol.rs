@@ -2,7 +2,7 @@ use std::error::Error;
 
 use bytes::BytesMut;
 
-use crate::RequestToken;
+use crate::{RequestToken, RxBuffer};
 
 /// Progress of protocol setup on a newly established TCP connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,10 +49,13 @@ impl<R> DecodedResponse<R> {
 
 /// Protocol-specific framing used by the generic single-connection driver.
 ///
-/// Implementations append requests directly to the reusable write buffer and
-/// remove complete responses from the front of the reusable read buffer.
+/// Implementations turn each admitted request into one owned wire frame and
+/// remove complete responses from the front of the reusable read buffer. The
+/// connection task retains frames until the socket has consumed every byte, so
+/// callers may use arena-backed storage without copying into another buffer.
 pub trait SessionProtocol: Send + 'static {
     type Request: Send + 'static;
+    type Frame: AsRef<[u8]> + Send + 'static;
     type Response: Send + 'static;
     type Error: Error + Send + Sync + 'static;
 
@@ -84,17 +87,24 @@ pub trait SessionProtocol: Send + 'static {
         Ok(HandshakeStatus::Ready)
     }
 
-    /// Append one request frame. `request_id` may be ignored by FIFO protocols.
+    /// Produce one complete, non-empty request frame.
+    ///
+    /// `request_id` may be ignored by FIFO protocols. Tagged protocols can
+    /// encode it into the returned frame without requiring a separate pending
+    /// request map.
     fn encode(
         &mut self,
-        request: &Self::Request,
+        request: Self::Request,
         request_id: RequestToken,
-        dst: &mut BytesMut,
-    ) -> std::result::Result<(), Self::Error>;
+    ) -> std::result::Result<Self::Frame, Self::Error>;
 
-    /// Decode at most one complete response, consuming its bytes from `src`.
+    /// Decode at most one complete response from the connection's dynamic ring.
+    ///
+    /// An incomplete decoder that has already observed a frame length should
+    /// call [`RxBuffer::reserve`] with the remaining byte count. This lets the
+    /// connection grow once before it continues draining the socket.
     fn decode(
         &mut self,
-        src: &mut BytesMut,
+        src: &mut RxBuffer,
     ) -> std::result::Result<Option<DecodedResponse<Self::Response>>, Self::Error>;
 }

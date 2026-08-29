@@ -30,6 +30,11 @@ pub enum NetError {
 
     #[error("session node must be created inside a Tokio runtime")]
     NoRuntime,
+
+    #[error(
+        "global request arena already uses chunk size {configured}, cannot change it to {requested}"
+    )]
+    RequestArenaAlreadyInitialized { configured: usize, requested: usize },
 }
 
 /// The result type used while constructing network components.
@@ -64,6 +69,9 @@ pub enum SessionError<E> {
 
     #[error("received a FIFO response without a pending request")]
     UnexpectedResponse,
+
+    #[error("protocol encoded an empty request frame")]
+    EmptyRequestFrame,
 }
 
 impl<E> Clone for SessionError<E> {
@@ -77,6 +85,7 @@ impl<E> Clone for SessionError<E> {
             Self::Protocol(error) => Self::Protocol(error.clone()),
             Self::Routing(error) => Self::Routing(error.clone()),
             Self::UnexpectedResponse => Self::UnexpectedResponse,
+            Self::EmptyRequestFrame => Self::EmptyRequestFrame,
         }
     }
 }
