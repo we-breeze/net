@@ -1,24 +1,53 @@
-//! Protocol-agnostic async TCP primitives for Breeze SDK clients.
+//! High-performance single-connection transports for Breeze SDK clients.
 
+#[cfg(not(loom))]
+mod arena;
+#[cfg(not(loom))]
 mod balance;
-mod client;
+#[cfg(not(loom))]
+mod completion;
+#[cfg(not(loom))]
 mod dns;
+#[cfg(not(loom))]
 mod error;
-mod maintenance;
-mod node;
-mod pool;
-mod provider;
+#[cfg(not(loom))]
+mod protocol;
+mod rx;
+#[cfg(not(loom))]
+mod session;
+#[cfg(not(loom))]
 mod sharded;
+#[cfg(not(loom))]
 mod source;
-mod stream;
+#[cfg(not(loom))]
+mod target;
 
-pub use balance::{QuotaBalancerOptions, ReplicaSnapshot};
-pub use client::TcpClient;
+#[cfg(not(loom))]
+pub use arena::{
+    DEFAULT_REQUEST_ARENA_CHUNK_SIZE, EphemeralBytes, EphemeralBytesArena, EphemeralBytesMut,
+    global_request_arena, init_global_request_arena,
+};
+#[cfg(not(loom))]
+pub use balance::{
+    NodeReplicaResponseFuture, QuotaBalancerOptions, ReplicaResponseFuture, ReplicaSet,
+    ReplicaSnapshot,
+};
+#[cfg(not(loom))]
+pub use completion::{MAX_IN_FLIGHT, RequestToken, ResponseFuture};
+#[cfg(not(loom))]
 pub use dns::{DnsOptions, DnsResolver, DnsResolverOptions, DnsSource};
-pub use error::{CallError, NetError, Result};
-pub use node::{NodePool, NodePoolOptions, NodePoolStats};
-pub use pool::Pool;
-pub use provider::{BoxFuture, OperationFuture, StreamProvider};
+#[cfg(not(loom))]
+pub use error::{NetError, Result, SessionError};
+#[cfg(not(loom))]
+pub use protocol::{Correlation, DecodedResponse, HandshakeStatus, SessionProtocol};
+pub use rx::{
+    ContiguousRxFrame, DEFAULT_MAX_RX_BUFFER_CAPACITY, RxBuffer, RxCapacityError, RxFrame,
+};
+#[cfg(not(loom))]
+pub use session::{Node, NodeOptions, NodeStats};
+#[cfg(not(loom))]
 pub use sharded::{ShardRouter, Sharded};
+#[cfg(not(loom))]
 pub use source::{EndpointSet, EndpointSource};
-pub use stream::BrzTcpStream;
+#[cfg(not(loom))]
+pub use target::RequestTarget;
