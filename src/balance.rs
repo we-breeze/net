@@ -117,6 +117,12 @@ impl QuotaSelector {
             }
         }
 
+        self.ticket(index)
+    }
+
+    #[inline]
+    fn ticket(&self, index: usize) -> QuotaTicket {
+        debug_assert!(index < self.inner.replicas.len());
         QuotaTicket {
             balancer: self.inner.clone(),
             index,
@@ -277,6 +283,52 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
         })
     }
 
+    /// Submit to the quota-selected replica and retry retryable transport
+    /// failures on subsequent replicas in the process-randomized order.
+    ///
+    /// `retries` counts additional attempts. It is capped at the number of
+    /// distinct remaining replicas, so one logical request is never sent to
+    /// the same physical node twice. Failed replicas remain in the set; their
+    /// failure cost is recorded in the normal quota accounting and the global
+    /// selector advances only when that quota is consumed.
+    pub async fn request_with_failover<F>(
+        &self,
+        retries: usize,
+        mut build: F,
+    ) -> std::result::Result<P::Response, SessionError<P::Error>>
+    where
+        F: FnMut() -> P::Request,
+    {
+        let first = self.balancer.select();
+        let first_index = first.index();
+        let attempts = retries.saturating_add(1).min(self.replicas.len());
+        let mut first = Some(first);
+
+        for offset in 0..attempts {
+            let index = (first_index + offset) % self.replicas.len();
+            let guard = first.take().unwrap_or_else(|| self.balancer.ticket(index));
+            let response = match self.replicas[index].request_with(&mut build) {
+                Ok(response) => response.await,
+                Err(error) => Err(error),
+            };
+
+            match response {
+                Ok(response) => {
+                    guard.success();
+                    return Ok(response);
+                }
+                Err(error) => {
+                    guard.failure();
+                    if !error.is_retryable_transport() || offset + 1 == attempts {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        unreachable!("a replica set always performs at least one attempt")
+    }
+
     /// Select one physical replica for a finite pipeline and submit all of its
     /// requests with all-or-nothing admission.
     ///
@@ -433,7 +485,7 @@ fn validate_options(options: QuotaBalancerOptions) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
+    use std::{io, sync::Barrier};
 
     use super::*;
 
@@ -480,6 +532,23 @@ mod tests {
     }
 
     #[test]
+    fn local_failover_does_not_advance_the_global_selector() {
+        let balancer = QuotaSelector::new(2, QuotaBalancerOptions::default()).unwrap();
+
+        let first = balancer.select();
+        assert_eq!(first.index(), 0);
+        finish(first, Duration::from_millis(1), false);
+
+        let retry = balancer.ticket(1);
+        assert_eq!(retry.index(), 1);
+        finish(retry, Duration::from_millis(1), true);
+
+        let next_global = balancer.select();
+        assert_eq!(next_global.index(), 0);
+        finish(next_global, Duration::ZERO, true);
+    }
+
+    #[test]
     fn concurrent_selectors_observe_one_atomic_quota_rotation() {
         let balancer = QuotaSelector::new(3, QuotaBalancerOptions::default()).unwrap();
         finish(balancer.select(), Duration::from_secs(2), true);
@@ -518,5 +587,31 @@ mod tests {
         .err()
         .unwrap();
         assert!(matches!(error, NetError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn transport_retry_classification_excludes_deterministic_failures() {
+        let retryable = [
+            SessionError::<io::Error>::Busy,
+            SessionError::Unavailable,
+            SessionError::Timeout {
+                timeout: Duration::from_millis(1),
+            },
+            SessionError::Closed,
+            SessionError::Io(Arc::new(io::Error::other("broken"))),
+        ];
+        assert!(retryable.iter().all(SessionError::is_retryable_transport));
+
+        let deterministic = [
+            SessionError::<io::Error>::Protocol(Arc::new(io::Error::other("protocol"))),
+            SessionError::Routing(Arc::new(NetError::NoReplicas)),
+            SessionError::UnexpectedResponse,
+            SessionError::EmptyRequestFrame,
+        ];
+        assert!(
+            deterministic
+                .iter()
+                .all(|error| !error.is_retryable_transport())
+        );
     }
 }
