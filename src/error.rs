@@ -74,6 +74,22 @@ pub enum SessionError<E> {
     EmptyRequestFrame,
 }
 
+impl<E> SessionError<E> {
+    /// Whether the request may succeed when resubmitted to another physical
+    /// replica.
+    ///
+    /// This only classifies transport admission and connection failures. A
+    /// protocol or routing failure is deterministic from the client's point
+    /// of view and must not be hidden by replica failover.
+    #[inline]
+    pub fn is_retryable_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::Busy | Self::Unavailable | Self::Timeout { .. } | Self::Closed | Self::Io(_)
+        )
+    }
+}
+
 impl<E> Clone for SessionError<E> {
     fn clone(&self) -> Self {
         match self {
