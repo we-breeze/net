@@ -29,8 +29,8 @@ pub use arena::{
 };
 #[cfg(not(loom))]
 pub use balance::{
-    NodeReplicaResponseFuture, QuotaBalancerOptions, ReplicaResponseFuture, ReplicaSet,
-    ReplicaSnapshot,
+    NodeReplicaResponseFuture, QuotaBalancerOptions, QuotaSelector, QuotaTicket,
+    ReplicaResponseFuture, ReplicaSet, ReplicaSnapshot,
 };
 #[cfg(not(loom))]
 pub use completion::{MAX_IN_FLIGHT, RequestToken, ResponseFuture};

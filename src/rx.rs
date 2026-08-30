@@ -255,7 +255,11 @@ impl RxBuffer {
 
     /// Periodic control-plane maintenance. It is intentionally not called by
     /// request admission or response lookup paths.
-    pub(crate) fn shrink(&mut self) {
+    /// Runs the periodic low-usage shrink policy.
+    ///
+    /// This belongs on a maintenance timer, never on request admission or
+    /// response decoding paths.
+    pub fn shrink(&mut self) {
         self.gc();
         let current_len = self.len();
         if let Some(target) = self
@@ -271,7 +275,8 @@ impl RxBuffer {
         self.capacity() > 0 && self.available() == 0
     }
 
-    pub(crate) fn prepare_read(&mut self) -> Result<(), RxCapacityError> {
+    /// Ensures that the ring exposes writable storage before a socket read.
+    pub fn prepare_read(&mut self) -> Result<(), RxCapacityError> {
         self.gc();
         if self.backing.is_none() {
             self.resize(self.minimum);
@@ -431,6 +436,15 @@ impl RxFrame {
         output.extend_from_slice(first);
         output.extend_from_slice(second);
         Bytes::from(output)
+    }
+
+    /// Returns the frame's one or two physical ring segments in logical order.
+    ///
+    /// Most frames occupy only `first`. A wrapped frame can be copied directly
+    /// into arena-backed storage without first allocating an intermediate
+    /// `Vec`.
+    pub fn segments(&self) -> (&[u8], &[u8]) {
+        self.backing.segments(self.start, self.length)
     }
 
     /// Convert a physically contiguous response to an owner suitable for

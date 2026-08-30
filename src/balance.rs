@@ -35,8 +35,13 @@ pub struct ReplicaSnapshot {
     pub current: bool,
 }
 
+/// Lock-free selector that keeps traffic on one replica until its accumulated
+/// request-time quota is consumed.
+///
+/// Selection only touches atomics. A dropped ticket is charged as a failure,
+/// so fail-fast admission errors naturally advance an unhealthy replica.
 #[derive(Clone)]
-pub(crate) struct QuotaBalancer {
+pub struct QuotaSelector {
     inner: Arc<BalancerInner>,
 }
 
@@ -51,8 +56,21 @@ struct ReplicaState {
     used_micros: AtomicU64,
 }
 
-impl QuotaBalancer {
-    pub(crate) fn new(replicas: usize, options: QuotaBalancerOptions) -> Result<Self> {
+impl QuotaSelector {
+    pub fn new(replicas: usize, options: QuotaBalancerOptions) -> Result<Self> {
+        Self::with_initial(replicas, options, 0)
+    }
+
+    /// Creates a selector whose first choice is `initial % replicas`.
+    ///
+    /// This is useful when replica order has semantic meaning (for example,
+    /// CacheService keeps master at index zero) and therefore cannot be
+    /// shuffled merely to randomize the process-wide starting point.
+    pub fn with_initial(
+        replicas: usize,
+        options: QuotaBalancerOptions,
+        initial: usize,
+    ) -> Result<Self> {
         validate_options(options)?;
         if replicas == 0 {
             return Err(NetError::NoReplicas);
@@ -60,7 +78,7 @@ impl QuotaBalancer {
 
         Ok(Self {
             inner: Arc::new(BalancerInner {
-                current: AtomicUsize::new(0),
+                current: AtomicUsize::new(initial % replicas),
                 replicas: (0..replicas)
                     .map(|_| ReplicaState {
                         used_micros: AtomicU64::new(0),
@@ -73,7 +91,7 @@ impl QuotaBalancer {
     }
 
     #[inline]
-    pub(crate) fn select(&self) -> QuotaGuard {
+    pub fn select(&self) -> QuotaTicket {
         let count = self.inner.replicas.len();
         let mut index = self.inner.current.load(Ordering::Relaxed);
 
@@ -99,7 +117,7 @@ impl QuotaBalancer {
             }
         }
 
-        QuotaGuard {
+        QuotaTicket {
             balancer: self.inner.clone(),
             index,
             started: Instant::now(),
@@ -107,7 +125,7 @@ impl QuotaBalancer {
         }
     }
 
-    pub(crate) fn snapshots(&self) -> Vec<ReplicaSnapshot> {
+    pub fn snapshots(&self) -> Vec<ReplicaSnapshot> {
         let current = self.inner.current.load(Ordering::Relaxed);
         self.inner
             .replicas
@@ -121,21 +139,41 @@ impl QuotaBalancer {
     }
 }
 
-pub(crate) struct QuotaGuard {
+/// One timed selection from a [`QuotaSelector`].
+///
+/// Call [`QuotaTicket::success`] for any valid protocol response, including a
+/// cache miss. Transport/protocol failure is represented by `failure`, while
+/// dropping without finishing is conservatively treated as failure.
+pub struct QuotaTicket {
     balancer: Arc<BalancerInner>,
     index: usize,
     started: Instant,
     finished: bool,
 }
 
-impl QuotaGuard {
-    pub(crate) fn index(&self) -> usize {
+impl QuotaTicket {
+    pub fn index(&self) -> usize {
         self.index
     }
 
-    fn finish(mut self, succeeded: bool) {
+    pub(crate) fn sibling(&self) -> Self {
+        Self {
+            balancer: self.balancer.clone(),
+            index: self.index,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub fn success(mut self) {
         let elapsed = self.started.elapsed();
-        self.record(elapsed, succeeded);
+        self.record(elapsed, true);
+        self.finished = true;
+    }
+
+    pub fn failure(mut self) {
+        let elapsed = self.started.elapsed();
+        self.record(elapsed, false);
         self.finished = true;
     }
 
@@ -152,7 +190,7 @@ impl QuotaGuard {
     }
 }
 
-impl Drop for QuotaGuard {
+impl Drop for QuotaTicket {
     fn drop(&mut self) {
         if !self.finished {
             self.record(self.started.elapsed(), false);
@@ -164,7 +202,7 @@ impl Drop for QuotaGuard {
 #[derive(Clone)]
 pub struct ReplicaSet<N> {
     replicas: Arc<[N]>,
-    balancer: QuotaBalancer,
+    balancer: QuotaSelector,
 }
 
 impl<N> ReplicaSet<N> {
@@ -182,7 +220,7 @@ impl<N> ReplicaSet<N> {
         }
         shuffle(&mut replicas);
         Ok(Self {
-            balancer: QuotaBalancer::new(replicas.len(), options)?,
+            balancer: QuotaSelector::new(replicas.len(), options)?,
             replicas: replicas.into(),
         })
     }
@@ -202,7 +240,7 @@ impl<N> ReplicaSet<N> {
 
 impl<P: SessionProtocol> ReplicaSet<Node<P>> {
     /// Select one node and submit immediately. Queue-full and disconnected
-    /// errors consume the configured failure penalty through `QuotaGuard::drop`.
+    /// errors consume the configured failure penalty through `QuotaTicket::drop`.
     #[inline]
     pub fn request(
         &self,
@@ -238,6 +276,39 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
             output: PhantomData,
         })
     }
+
+    /// Select one physical replica for a finite pipeline and submit all of its
+    /// requests with all-or-nothing admission.
+    ///
+    /// Every response retains an independent quota timer even though replica
+    /// selection happens only once for the whole pipeline.
+    pub fn request_batch(
+        &self,
+        requests: Vec<P::Request>,
+    ) -> std::result::Result<Vec<NodeReplicaResponseFuture<P>>, SessionError<P::Error>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let guard = self.balancer.select();
+        let index = guard.index();
+        let responses = self.replicas[index].request_batch(requests)?;
+        let mut guards = Vec::with_capacity(responses.len());
+        for _ in 1..responses.len() {
+            guards.push(guard.sibling());
+        }
+        guards.push(guard);
+
+        Ok(responses
+            .into_iter()
+            .zip(guards)
+            .map(|(response, guard)| ReplicaResponseFuture {
+                response,
+                guard: Some(guard),
+                output: PhantomData,
+            })
+            .collect())
+    }
 }
 
 impl<N: std::fmt::Debug> std::fmt::Debug for ReplicaSet<N> {
@@ -265,7 +336,7 @@ pub type NodeReplicaResponseFuture<P> = ReplicaResponseFuture<
 /// Response Future that charges elapsed time to the selected replica.
 pub struct ReplicaResponseFuture<F, T, E> {
     response: F,
-    guard: Option<QuotaGuard>,
+    guard: Option<QuotaTicket>,
     output: PhantomData<fn() -> (T, E)>,
 }
 
@@ -289,10 +360,15 @@ where
     ) -> std::task::Poll<Self::Output> {
         match std::pin::Pin::new(&mut self.response).poll(context) {
             std::task::Poll::Ready(result) => {
-                self.guard
+                let guard = self
+                    .guard
                     .take()
-                    .expect("quota guard is present until response completion")
-                    .finish(result.is_ok());
+                    .expect("quota guard is present until response completion");
+                if result.is_ok() {
+                    guard.success();
+                } else {
+                    guard.failure();
+                }
                 std::task::Poll::Ready(result)
             }
             std::task::Poll::Pending => std::task::Poll::Pending,
@@ -361,14 +437,14 @@ mod tests {
 
     use super::*;
 
-    fn finish(mut guard: QuotaGuard, elapsed: Duration, succeeded: bool) {
+    fn finish(mut guard: QuotaTicket, elapsed: Duration, succeeded: bool) {
         guard.record(elapsed, succeeded);
         guard.finished = true;
     }
 
     #[test]
     fn requests_stay_on_one_replica_until_its_quota_is_consumed() {
-        let balancer = QuotaBalancer::new(3, QuotaBalancerOptions::default()).unwrap();
+        let balancer = QuotaSelector::new(3, QuotaBalancerOptions::default()).unwrap();
 
         let first = balancer.select();
         assert_eq!(first.index(), 0);
@@ -389,7 +465,7 @@ mod tests {
 
     #[test]
     fn failed_requests_consume_at_least_five_hundred_milliseconds() {
-        let balancer = QuotaBalancer::new(2, QuotaBalancerOptions::default()).unwrap();
+        let balancer = QuotaSelector::new(2, QuotaBalancerOptions::default()).unwrap();
 
         for _ in 0..4 {
             let guard = balancer.select();
@@ -405,7 +481,7 @@ mod tests {
 
     #[test]
     fn concurrent_selectors_observe_one_atomic_quota_rotation() {
-        let balancer = QuotaBalancer::new(3, QuotaBalancerOptions::default()).unwrap();
+        let balancer = QuotaSelector::new(3, QuotaBalancerOptions::default()).unwrap();
         finish(balancer.select(), Duration::from_secs(2), true);
 
         let workers = 16;
@@ -432,7 +508,7 @@ mod tests {
 
     #[test]
     fn invalid_sub_microsecond_options_are_rejected() {
-        let error = QuotaBalancer::new(
+        let error = QuotaSelector::new(
             2,
             QuotaBalancerOptions {
                 quota: Duration::from_nanos(999),

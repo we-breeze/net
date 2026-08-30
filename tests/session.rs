@@ -244,6 +244,22 @@ async fn many_fifo_requests_share_exactly_one_tcp_connection() {
 }
 
 #[tokio::test]
+async fn finite_batch_submits_independent_fifo_requests_in_order() {
+    let (address, accepts) = spawn_fifo_echo().await;
+    let node = Node::new(address, ByteFifo, test_options()).unwrap();
+    wait_until(|| node.is_connected()).await;
+
+    let responses = node.request_batch((0_u8..128).collect()).unwrap();
+    assert_eq!(responses.len(), 128);
+    for (expected, response) in (0_u8..128).zip(responses) {
+        assert_eq!(response.await.unwrap(), expected);
+    }
+
+    assert_eq!(accepts.load(Ordering::Relaxed), 1);
+    assert_eq!(node.stats().active_requests, 0);
+}
+
+#[tokio::test]
 async fn tagged_responses_may_arrive_out_of_order() {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
