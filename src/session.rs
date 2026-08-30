@@ -30,7 +30,7 @@ use crate::{
 
 const DEFAULT_READ_BUFFER_CAPACITY: usize = 2 * 1024;
 const RX_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
-const MAX_WRITE_VECTORS: usize = 4;
+const MAX_WRITE_VECTORS: usize = 64;
 
 type ResponseResult<P> = std::result::Result<
     <P as SessionProtocol>::Response,
@@ -71,7 +71,6 @@ pub struct NodeOptions {
     pub reconnect_delay: Duration,
     pub max_reconnect_delay: Duration,
     pub tcp_nodelay: bool,
-    pub write_batch: usize,
     pub read_buffer_capacity: usize,
     pub max_read_buffer_capacity: usize,
 }
@@ -84,7 +83,6 @@ impl Default for NodeOptions {
             reconnect_delay: Duration::from_millis(50),
             max_reconnect_delay: Duration::from_secs(2),
             tcp_nodelay: true,
-            write_batch: 4,
             read_buffer_capacity: DEFAULT_READ_BUFFER_CAPACITY,
             max_read_buffer_capacity: DEFAULT_MAX_RX_BUFFER_CAPACITY,
         }
@@ -112,11 +110,6 @@ impl NodeOptions {
             return Err(NetError::InvalidConfig(
                 "max_reconnect_delay must be at least reconnect_delay".into(),
             ));
-        }
-        if !(1..=MAX_WRITE_VECTORS).contains(&self.write_batch) {
-            return Err(NetError::InvalidConfig(format!(
-                "write_batch must be between 1 and {MAX_WRITE_VECTORS}"
-            )));
         }
         if self.read_buffer_capacity == 0 {
             return Err(NetError::InvalidConfig(
@@ -280,6 +273,73 @@ impl<P: SessionProtocol> Node<P> {
         Ok(future.publish())
     }
 
+    /// Submit one finite request pipeline without waiting for queue capacity.
+    ///
+    /// Admission is all-or-nothing: queue permits and response slots for every
+    /// request are reserved before any envelope is published to the driver.
+    /// Each returned future still owns an independent completion token and
+    /// request deadline.
+    pub fn request_batch(
+        &self,
+        requests: Vec<P::Request>,
+    ) -> std::result::Result<Vec<ResponseFuture<ResponseResult<P>>>, SessionError<P::Error>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if requests.len() > MAX_IN_FLIGHT {
+            return Err(SessionError::Busy);
+        }
+        if !self.inner.shared.connected.load(Ordering::Acquire) {
+            return Err(SessionError::Unavailable);
+        }
+        let connection_generation = self
+            .inner
+            .shared
+            .connection_generation
+            .load(Ordering::Acquire);
+
+        let permits = match self.inner.requests.try_reserve_many(requests.len()) {
+            Ok(permits) => permits,
+            Err(mpsc::error::TrySendError::Full(())) => return Err(SessionError::Busy),
+            Err(mpsc::error::TrySendError::Closed(())) => return Err(SessionError::Closed),
+        };
+
+        let mut responses = Vec::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            let Some((_token, future)) = self.inner.shared.completions.reserve() else {
+                return Err(SessionError::Busy);
+            };
+            responses.push(ResponseReservation::new(future));
+        }
+
+        if !self.inner.shared.connected.load(Ordering::Acquire)
+            || self
+                .inner
+                .shared
+                .connection_generation
+                .load(Ordering::Acquire)
+                != connection_generation
+        {
+            return Err(SessionError::Unavailable);
+        }
+
+        let mut published = Vec::with_capacity(requests.len());
+        for ((permit, request), response) in permits.zip(requests).zip(responses) {
+            let token = response
+                .future
+                .as_ref()
+                .expect("response reservation is present")
+                .request_token();
+            permit.send(Envelope {
+                token,
+                connection_generation,
+                request,
+            });
+            published.push(response.publish());
+        }
+        Ok(published)
+    }
+
     #[inline]
     pub fn is_connected(&self) -> bool {
         self.inner.shared.connected.load(Ordering::Acquire)
@@ -353,16 +413,13 @@ enum DriveError<E> {
 struct WriteQueue<F> {
     frames: VecDeque<F>,
     front_offset: usize,
-    max_vectors: usize,
 }
 
 impl<F: AsRef<[u8]>> WriteQueue<F> {
-    fn new(max_vectors: usize) -> Self {
-        let max_vectors = max_vectors.clamp(1, MAX_WRITE_VECTORS);
+    fn new() -> Self {
         Self {
-            frames: VecDeque::with_capacity(max_vectors),
+            frames: VecDeque::new(),
             front_offset: 0,
-            max_vectors,
         }
     }
 
@@ -385,7 +442,7 @@ impl<F: AsRef<[u8]>> WriteQueue<F> {
         cx: &mut Context<'_>,
         writer: &mut W,
     ) -> Poll<std::io::Result<usize>> {
-        let count = self.frames.len().min(self.max_vectors);
+        let count = self.frames.len().min(MAX_WRITE_VECTORS);
         let written = if writer.is_write_vectored() && count > 1 {
             let mut slices = [IoSlice::new(&[]); MAX_WRITE_VECTORS];
             for (index, frame) in self.frames.iter().take(count).enumerate() {
@@ -454,8 +511,8 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                 options.read_buffer_capacity,
                 options.max_read_buffer_capacity,
             ),
-            writes: WriteQueue::new(options.write_batch),
-            batch: VecDeque::with_capacity(options.write_batch),
+            writes: WriteQueue::new(),
+            batch: VecDeque::new(),
         }
     }
 
@@ -668,7 +725,7 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                         return DriveError::Closed;
                     };
                     self.batch.push_back(request);
-                    while self.batch.len() < self.options.write_batch {
+                    while self.batch.len() < MAX_WRITE_VECTORS {
                         match self.requests.try_recv() {
                             Ok(request) => self.batch.push_back(request),
                             Err(mpsc::error::TryRecvError::Empty) => break,
@@ -972,7 +1029,7 @@ mod tests {
             maximum_write: usize::MAX,
             ..CountingWriter::default()
         };
-        let mut writes = WriteQueue::new(MAX_WRITE_VECTORS);
+        let mut writes = WriteQueue::new();
 
         assert!(writes.push(&b"one"[..]));
         assert!(matches!(
@@ -1000,7 +1057,7 @@ mod tests {
             maximum_write: 4,
             ..CountingWriter::default()
         };
-        let mut writes = WriteQueue::new(MAX_WRITE_VECTORS);
+        let mut writes = WriteQueue::new();
         assert!(writes.push(&b"abc"[..]));
         assert!(writes.push(&b"def"[..]));
 
@@ -1021,22 +1078,16 @@ mod tests {
     }
 
     #[test]
-    fn defaults_use_a_two_kib_receive_ring_and_four_frame_write_batch() {
+    fn defaults_use_a_two_kib_receive_ring() {
         let options = NodeOptions::default();
 
         assert_eq!(options.read_buffer_capacity, 2 * 1024);
-        assert_eq!(options.write_batch, MAX_WRITE_VECTORS);
         assert!(options.validate().is_ok());
     }
 
     #[test]
-    fn write_batch_is_bounded_by_the_stack_iovec_array() {
-        let options = NodeOptions {
-            write_batch: MAX_WRITE_VECTORS + 1,
-            ..NodeOptions::default()
-        };
-
-        assert!(options.validate().is_err());
+    fn writev_stack_array_accepts_sixty_four_frames() {
+        assert_eq!(MAX_WRITE_VECTORS, 64);
     }
 
     #[test]
