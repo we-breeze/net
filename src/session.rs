@@ -23,7 +23,7 @@ use tokio::{
 
 use crate::{
     Correlation, HandshakeStatus, NetError, RequestTarget, RequestToken, ResponseFuture, Result,
-    RxBuffer, SessionError, SessionProtocol,
+    RxBuffer, SessionError, SessionProtocol, TimedResponseFuture,
     completion::{CompletionTable, MAX_IN_FLIGHT},
     rx::DEFAULT_MAX_RX_BUFFER_CAPACITY,
 };
@@ -137,6 +137,14 @@ pub struct NodeStats {
     pub disconnects: u64,
 }
 
+/// Receives low-frequency connection lifecycle transitions from one physical node.
+///
+/// Implementations run on the node's connection driver and must complete quickly. The callback is
+/// never invoked for repeated connection failures while the node remains disconnected.
+pub trait NodeConnectionObserver: Send + Sync + 'static {
+    fn on_connection_state_change(&self, connected: bool);
+}
+
 /// Cloneable, fail-fast request handle for one physical endpoint.
 ///
 /// Exactly one background task owns exactly one TCP stream for this node.
@@ -168,6 +176,25 @@ impl<P: SessionProtocol> Clone for Node<P> {
 
 impl<P: SessionProtocol> Node<P> {
     pub fn new(endpoint: std::net::SocketAddr, protocol: P, options: NodeOptions) -> Result<Self> {
+        Self::new_inner(endpoint, protocol, options, None)
+    }
+
+    /// Creates a node that reports successful connection and disconnection transitions.
+    pub fn new_observed(
+        endpoint: std::net::SocketAddr,
+        protocol: P,
+        options: NodeOptions,
+        observer: Arc<dyn NodeConnectionObserver>,
+    ) -> Result<Self> {
+        Self::new_inner(endpoint, protocol, options, Some(observer))
+    }
+
+    fn new_inner(
+        endpoint: std::net::SocketAddr,
+        protocol: P,
+        options: NodeOptions,
+        observer: Option<Arc<dyn NodeConnectionObserver>>,
+    ) -> Result<Self> {
         let options = options.validate()?;
         let runtime = Handle::try_current().map_err(|_| NetError::NoRuntime)?;
         let completions = CompletionTable::new();
@@ -179,7 +206,14 @@ impl<P: SessionProtocol> Node<P> {
             disconnects: AtomicU64::new(0),
         });
         let (requests, request_rx) = mpsc::channel(MAX_IN_FLIGHT);
-        let driver = ConnectionDriver::new(endpoint, protocol, options, request_rx, shared.clone());
+        let driver = ConnectionDriver::new(
+            endpoint,
+            protocol,
+            options,
+            request_rx,
+            shared.clone(),
+            observer,
+        );
         runtime.spawn(driver.run());
 
         Ok(Self {
@@ -215,6 +249,30 @@ impl<P: SessionProtocol> Node<P> {
     where
         F: FnOnce() -> P::Request,
     {
+        self.request_with_capture(build, false)
+    }
+
+    /// Reserve and submit one request while retaining driver-side send timing.
+    #[inline]
+    pub fn request_with_timing<F>(
+        &self,
+        build: F,
+    ) -> std::result::Result<TimedResponseFuture<ResponseResult<P>>, SessionError<P::Error>>
+    where
+        F: FnOnce() -> P::Request,
+    {
+        self.request_with_capture(build, true)
+            .map(ResponseFuture::with_timing)
+    }
+
+    fn request_with_capture<F>(
+        &self,
+        build: F,
+        capture_timing: bool,
+    ) -> std::result::Result<ResponseFuture<ResponseResult<P>>, SessionError<P::Error>>
+    where
+        F: FnOnce() -> P::Request,
+    {
         if !self.inner.shared.connected.load(Ordering::Acquire) {
             return Err(SessionError::Unavailable);
         }
@@ -233,6 +291,9 @@ impl<P: SessionProtocol> Node<P> {
         let Some((token, future)) = self.inner.shared.completions.reserve() else {
             return Err(SessionError::Busy);
         };
+        if capture_timing {
+            self.inner.shared.completions.enable_timing(token);
+        }
         let future = ResponseReservation::new(future);
 
         // Close the race with a disconnect between the first availability
@@ -268,6 +329,7 @@ impl<P: SessionProtocol> Node<P> {
             token,
             connection_generation,
             request,
+            capture_timing,
         };
         permit.send(envelope);
         Ok(future.publish())
@@ -282,6 +344,29 @@ impl<P: SessionProtocol> Node<P> {
     pub fn request_batch(
         &self,
         requests: Vec<P::Request>,
+    ) -> std::result::Result<Vec<ResponseFuture<ResponseResult<P>>>, SessionError<P::Error>> {
+        self.request_batch_capture(requests, false)
+    }
+
+    /// Submit a finite request pipeline while retaining driver-side timing for
+    /// every independently completed request.
+    pub fn request_batch_with_timing(
+        &self,
+        requests: Vec<P::Request>,
+    ) -> std::result::Result<Vec<TimedResponseFuture<ResponseResult<P>>>, SessionError<P::Error>>
+    {
+        self.request_batch_capture(requests, true).map(|responses| {
+            responses
+                .into_iter()
+                .map(ResponseFuture::with_timing)
+                .collect()
+        })
+    }
+
+    fn request_batch_capture(
+        &self,
+        requests: Vec<P::Request>,
+        capture_timing: bool,
     ) -> std::result::Result<Vec<ResponseFuture<ResponseResult<P>>>, SessionError<P::Error>> {
         if requests.is_empty() {
             return Ok(Vec::new());
@@ -306,9 +391,12 @@ impl<P: SessionProtocol> Node<P> {
 
         let mut responses = Vec::with_capacity(requests.len());
         for _ in 0..requests.len() {
-            let Some((_token, future)) = self.inner.shared.completions.reserve() else {
+            let Some((token, future)) = self.inner.shared.completions.reserve() else {
                 return Err(SessionError::Busy);
             };
+            if capture_timing {
+                self.inner.shared.completions.enable_timing(token);
+            }
             responses.push(ResponseReservation::new(future));
         }
 
@@ -334,6 +422,7 @@ impl<P: SessionProtocol> Node<P> {
                 token,
                 connection_generation,
                 request,
+                capture_timing,
             });
             published.push(response.publish());
         }
@@ -394,12 +483,14 @@ struct Envelope<R> {
     token: RequestToken,
     connection_generation: u64,
     request: R,
+    capture_timing: bool,
 }
 
 #[derive(Clone, Copy)]
 struct Pending {
     token: RequestToken,
     deadline: Instant,
+    capture_timing: bool,
 }
 
 enum DriveError<E> {
@@ -488,6 +579,7 @@ struct ConnectionDriver<P: SessionProtocol> {
     options: NodeOptions,
     requests: mpsc::Receiver<Envelope<P::Request>>,
     shared: Arc<Shared<P>>,
+    observer: Option<Arc<dyn NodeConnectionObserver>>,
     read_buffer: RxBuffer,
     writes: WriteQueue<P::Frame>,
     batch: VecDeque<Envelope<P::Request>>,
@@ -500,6 +592,7 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
         options: NodeOptions,
         requests: mpsc::Receiver<Envelope<P::Request>>,
         shared: Arc<Shared<P>>,
+        observer: Option<Arc<dyn NodeConnectionObserver>>,
     ) -> Self {
         Self {
             endpoint,
@@ -507,6 +600,7 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
             options,
             requests,
             shared,
+            observer,
             read_buffer: RxBuffer::new(
                 options.read_buffer_capacity,
                 options.max_read_buffer_capacity,
@@ -551,10 +645,16 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                 .successful_connections
                 .fetch_add(1, Ordering::Relaxed);
             self.shared.connected.store(true, Ordering::Release);
+            if let Some(observer) = &self.observer {
+                observer.on_connection_state_change(true);
+            }
 
             let mut pending = VecDeque::with_capacity(MAX_IN_FLIGHT);
             let result = self.drive(&mut stream, &mut pending).await;
             self.shared.connected.store(false, Ordering::Release);
+            if let Some(observer) = &self.observer {
+                observer.on_connection_state_change(false);
+            }
 
             let closed = matches!(result, DriveError::Closed);
             let error = match result {
@@ -761,9 +861,13 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                             .complete(envelope.token, Err(SessionError::EmptyRequestFrame));
                         continue;
                     }
+                    if envelope.capture_timing {
+                        self.shared.completions.mark_sent(envelope.token);
+                    }
                     pending.push_back(Pending {
                         token: envelope.token,
                         deadline: Instant::now() + self.options.request_timeout,
+                        capture_timing: envelope.capture_timing,
                     });
                 }
                 Err(error) => {
@@ -793,22 +897,32 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
                     let Some(request) = pending.pop_front() else {
                         return Err(DriveError::UnexpectedResponse);
                     };
-                    self.shared
-                        .completions
-                        .complete(request.token, Ok(decoded.response));
+                    if request.capture_timing {
+                        self.shared
+                            .completions
+                            .complete_timed(request.token, Ok(decoded.response));
+                    } else {
+                        self.shared
+                            .completions
+                            .complete(request.token, Ok(decoded.response));
+                    }
                 }
                 Correlation::Tagged(request_id) => {
-                    if let Some(index) = pending
+                    let request = pending
                         .iter()
                         .position(|pending| pending.token == request_id)
-                    {
-                        pending.remove(index);
-                    }
+                        .and_then(|index| pending.remove(index));
                     // A false result is a timed-out, cancelled, duplicate, or
                     // otherwise late response and is intentionally ignored.
-                    self.shared
-                        .completions
-                        .complete(request_id, Ok(decoded.response));
+                    if request.is_some_and(|request| request.capture_timing) {
+                        self.shared
+                            .completions
+                            .complete_timed(request_id, Ok(decoded.response));
+                    } else {
+                        self.shared
+                            .completions
+                            .complete(request_id, Ok(decoded.response));
+                    }
                 }
             }
         }
@@ -816,9 +930,15 @@ impl<P: SessionProtocol> ConnectionDriver<P> {
 
     fn fail_pending(&self, pending: &mut VecDeque<Pending>, error: SessionError<P::Error>) {
         while let Some(request) = pending.pop_front() {
-            self.shared
-                .completions
-                .complete(request.token, Err(error.clone()));
+            if request.capture_timing {
+                self.shared
+                    .completions
+                    .complete_timed(request.token, Err(error.clone()));
+            } else {
+                self.shared
+                    .completions
+                    .complete(request.token, Err(error.clone()));
+            }
         }
     }
 

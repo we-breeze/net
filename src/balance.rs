@@ -211,6 +211,73 @@ pub struct ReplicaSet<N> {
     balancer: QuotaSelector,
 }
 
+/// One physical session target that can participate in replica selection.
+///
+/// Protocol crates may wrap a [`Node`] with endpoint-local state such as
+/// metrics while keeping selection, retry, and quota accounting in `brz-net`.
+/// All dispatch remains static; the request path does not allocate a callback
+/// or use dynamic dispatch.
+pub trait SessionReplica: Clone + Send + Sync + 'static {
+    type Request: Send + 'static;
+    type Response: Send + 'static;
+    type Error: std::error::Error + Send + Sync + 'static;
+    type Future: std::future::Future<Output = std::result::Result<Self::Response, SessionError<Self::Error>>>
+        + Send
+        + Unpin
+        + 'static;
+
+    fn request(
+        &self,
+        request: Self::Request,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>>;
+
+    fn request_with<F>(
+        &self,
+        build: F,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>>
+    where
+        F: FnOnce() -> Self::Request;
+
+    fn request_batch(
+        &self,
+        requests: Vec<Self::Request>,
+    ) -> std::result::Result<Vec<Self::Future>, SessionError<Self::Error>>;
+}
+
+impl<P: SessionProtocol> SessionReplica for Node<P> {
+    type Request = P::Request;
+    type Response = P::Response;
+    type Error = P::Error;
+    type Future = ResponseFuture<NodeReplicaResult<P>>;
+
+    #[inline]
+    fn request(
+        &self,
+        request: Self::Request,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>> {
+        Node::request(self, request)
+    }
+
+    #[inline]
+    fn request_with<F>(
+        &self,
+        build: F,
+    ) -> std::result::Result<Self::Future, SessionError<Self::Error>>
+    where
+        F: FnOnce() -> Self::Request,
+    {
+        Node::request_with(self, build)
+    }
+
+    #[inline]
+    fn request_batch(
+        &self,
+        requests: Vec<Self::Request>,
+    ) -> std::result::Result<Vec<Self::Future>, SessionError<Self::Error>> {
+        Node::request_batch(self, requests)
+    }
+}
+
 impl<N> ReplicaSet<N> {
     pub fn new(replicas: impl IntoIterator<Item = N>) -> Result<Self> {
         Self::with_options(replicas, QuotaBalancerOptions::default())
@@ -244,14 +311,14 @@ impl<N> ReplicaSet<N> {
     }
 }
 
-impl<P: SessionProtocol> ReplicaSet<Node<P>> {
+impl<R: SessionReplica> ReplicaSet<R> {
     /// Select one node and submit immediately. Queue-full and disconnected
     /// errors consume the configured failure penalty through `QuotaTicket::drop`.
     #[inline]
     pub fn request(
         &self,
-        request: P::Request,
-    ) -> std::result::Result<NodeReplicaResponseFuture<P>, SessionError<P::Error>> {
+        request: R::Request,
+    ) -> std::result::Result<ReplicaSetResponseFuture<R>, SessionError<R::Error>> {
         let guard = self.balancer.select();
         let index = guard.index();
         let response = self.replicas[index].request(request)?;
@@ -269,9 +336,9 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
     pub fn request_with<F>(
         &self,
         build: F,
-    ) -> std::result::Result<NodeReplicaResponseFuture<P>, SessionError<P::Error>>
+    ) -> std::result::Result<ReplicaSetResponseFuture<R>, SessionError<R::Error>>
     where
-        F: FnOnce() -> P::Request,
+        F: FnOnce() -> R::Request,
     {
         let guard = self.balancer.select();
         let index = guard.index();
@@ -295,9 +362,9 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
         &self,
         retries: usize,
         mut build: F,
-    ) -> std::result::Result<P::Response, SessionError<P::Error>>
+    ) -> std::result::Result<R::Response, SessionError<R::Error>>
     where
-        F: FnMut() -> P::Request,
+        F: FnMut() -> R::Request,
     {
         let first = self.balancer.select();
         let first_index = first.index();
@@ -336,8 +403,8 @@ impl<P: SessionProtocol> ReplicaSet<Node<P>> {
     /// selection happens only once for the whole pipeline.
     pub fn request_batch(
         &self,
-        requests: Vec<P::Request>,
-    ) -> std::result::Result<Vec<NodeReplicaResponseFuture<P>>, SessionError<P::Error>> {
+        requests: Vec<R::Request>,
+    ) -> std::result::Result<Vec<ReplicaSetResponseFuture<R>>, SessionError<R::Error>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -378,12 +445,15 @@ type NodeReplicaResult<P> = std::result::Result<
     SessionError<<P as SessionProtocol>::Error>,
 >;
 
-/// Response future returned by the direct `ReplicaSet<Node<P>>::request` API.
-pub type NodeReplicaResponseFuture<P> = ReplicaResponseFuture<
-    ResponseFuture<NodeReplicaResult<P>>,
-    <P as SessionProtocol>::Response,
-    <P as SessionProtocol>::Error,
+/// Response future returned by a [`ReplicaSet`] for any session replica.
+pub type ReplicaSetResponseFuture<R> = ReplicaResponseFuture<
+    <R as SessionReplica>::Future,
+    <R as SessionReplica>::Response,
+    <R as SessionReplica>::Error,
 >;
+
+/// Response future returned by the direct `ReplicaSet<Node<P>>::request` API.
+pub type NodeReplicaResponseFuture<P> = ReplicaSetResponseFuture<Node<P>>;
 
 /// Response Future that charges elapsed time to the selected replica.
 pub struct ReplicaResponseFuture<F, T, E> {
