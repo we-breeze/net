@@ -30,10 +30,12 @@ pub use arena::{
 #[cfg(not(loom))]
 pub use balance::{
     NodeReplicaResponseFuture, QuotaBalancerOptions, QuotaSelector, QuotaTicket,
-    ReplicaResponseFuture, ReplicaSet, ReplicaSnapshot,
+    ReplicaResponseFuture, ReplicaSet, ReplicaSetResponseFuture, ReplicaSnapshot, SessionReplica,
 };
 #[cfg(not(loom))]
-pub use completion::{MAX_IN_FLIGHT, RequestToken, ResponseFuture};
+pub use completion::{
+    AttemptTiming, MAX_IN_FLIGHT, RequestToken, ResponseFuture, TimedResponse, TimedResponseFuture,
+};
 #[cfg(not(loom))]
 pub use dns::{DnsOptions, DnsResolver, DnsResolverOptions, DnsSource};
 #[cfg(not(loom))]
@@ -44,7 +46,7 @@ pub use rx::{
     ContiguousRxFrame, DEFAULT_MAX_RX_BUFFER_CAPACITY, RxBuffer, RxCapacityError, RxFrame,
 };
 #[cfg(not(loom))]
-pub use session::{Node, NodeOptions, NodeStats};
+pub use session::{Node, NodeConnectionObserver, NodeOptions, NodeStats};
 #[cfg(not(loom))]
 pub use sharded::{ShardRouter, Sharded};
 #[cfg(not(loom))]

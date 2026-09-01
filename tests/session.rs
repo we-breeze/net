@@ -9,8 +9,8 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use net::{
-    DecodedResponse, HandshakeStatus, MAX_IN_FLIGHT, Node, NodeOptions, ReplicaSet, RequestTarget,
-    RequestToken, RxBuffer, SessionError, SessionProtocol, Sharded,
+    DecodedResponse, HandshakeStatus, MAX_IN_FLIGHT, Node, NodeConnectionObserver, NodeOptions,
+    ReplicaSet, RequestTarget, RequestToken, RxBuffer, SessionError, SessionProtocol, Sharded,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -18,6 +18,22 @@ use tokio::{
     sync::Notify,
     time::{Instant, sleep},
 };
+
+#[derive(Default)]
+struct ConnectionTransitions {
+    connected: AtomicUsize,
+    disconnected: AtomicUsize,
+}
+
+impl NodeConnectionObserver for ConnectionTransitions {
+    fn on_connection_state_change(&self, connected: bool) {
+        if connected {
+            self.connected.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.disconnected.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 struct ByteFifo;
@@ -241,6 +257,32 @@ async fn many_fifo_requests_share_exactly_one_tcp_connection() {
     assert_eq!(accepts.load(Ordering::Relaxed), 1);
     assert_eq!(node.stats().successful_connections, 1);
     assert_eq!(node.stats().active_requests, 0);
+}
+
+#[tokio::test]
+async fn timed_request_reports_only_the_post_send_attempt_duration() {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = stream.read_u8().await.unwrap();
+        sleep(Duration::from_millis(10)).await;
+        stream.write_u8(request).await.unwrap();
+    });
+
+    let node = Node::new(address, ByteFifo, test_options()).unwrap();
+    wait_until(|| node.is_connected()).await;
+    let response = node.request_with_timing(|| 7).unwrap().await;
+
+    assert_eq!(response.value.unwrap(), 7);
+    let real = response
+        .timing
+        .sent_to_completed
+        .expect("encoded non-empty frame must reach the send stage");
+    assert!(real >= Duration::from_millis(5));
+    assert!(real < Duration::from_secs(1));
 }
 
 #[tokio::test]
@@ -492,7 +534,8 @@ async fn idle_peer_close_is_detected_and_reconnected_before_the_next_request() {
         }
     });
 
-    let node = Node::new(address, ByteFifo, test_options()).unwrap();
+    let transitions = Arc::new(ConnectionTransitions::default());
+    let node = Node::new_observed(address, ByteFifo, test_options(), transitions.clone()).unwrap();
     wait_until(|| node.is_connected() && accepts.load(Ordering::Relaxed) == 1).await;
     assert_eq!(node.stats().active_requests, 0);
 
@@ -501,11 +544,14 @@ async fn idle_peer_close_is_detected_and_reconnected_before_the_next_request() {
         node.is_connected()
             && node.stats().successful_connections >= 2
             && accepts.load(Ordering::Relaxed) >= 2
+            && transitions.connected.load(Ordering::Relaxed) >= 2
     })
     .await;
 
     assert_eq!(node.request(23).unwrap().await.unwrap(), 23);
     assert_eq!(node.stats().disconnects, 1);
+    assert_eq!(transitions.connected.load(Ordering::Relaxed), 2);
+    assert_eq!(transitions.disconnected.load(Ordering::Relaxed), 1);
 }
 
 #[tokio::test]

@@ -6,10 +6,11 @@ use std::{
     pin::Pin,
     ptr,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
+    time::{Duration, Instant},
 };
 
 use atomic_waker::AtomicWaker;
@@ -24,6 +25,29 @@ const READY: usize = 1 << 2;
 const RECEIVER_DONE: usize = 1 << 3;
 const VALUE_TAKEN: usize = 1 << 4;
 const DRIVER_DONE: usize = 1 << 5;
+
+static TIMING_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+#[inline]
+fn timing_tick() -> u64 {
+    let elapsed = TIMING_EPOCH.get_or_init(Instant::now).elapsed().as_nanos();
+    elapsed.min((u64::MAX - 1) as u128) as u64 + 1
+}
+
+/// Driver-side timing for one physical session attempt.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttemptTiming {
+    /// Time from accepting the encoded frame into the socket write queue until
+    /// the attempt completed. `None` means the attempt failed before send.
+    pub sent_to_completed: Option<Duration>,
+}
+
+/// A response value paired with its physical-session timing.
+#[derive(Debug)]
+pub struct TimedResponse<T> {
+    pub value: T,
+    pub timing: AttemptTiming,
+}
 
 /// Opaque per-connection request identifier.
 ///
@@ -78,6 +102,8 @@ struct ResponseSlot<T> {
     state: AtomicUsize,
     value: UnsafeCell<MaybeUninit<T>>,
     waker: AtomicWaker,
+    sent_tick: AtomicU64,
+    completed_tick: AtomicU64,
 }
 
 // State transitions guarantee one driver writer and one Future reader.
@@ -91,6 +117,8 @@ impl<T> CompletionTable<T> {
                 state: AtomicUsize::new(0),
                 value: UnsafeCell::new(MaybeUninit::uninit()),
                 waker: AtomicWaker::new(),
+                sent_tick: AtomicU64::new(0),
+                completed_tick: AtomicU64::new(0),
             })),
             free: std::array::from_fn(|_| AtomicU64::new(u64::MAX)),
             cursor: AtomicUsize::new(0),
@@ -150,6 +178,14 @@ impl<T> CompletionTable<T> {
 
     /// Complete one request. Returns false for stale or duplicate responses.
     pub(crate) fn complete(&self, token: RequestToken, value: T) -> bool {
+        self.complete_inner(token, value, false)
+    }
+
+    pub(crate) fn complete_timed(&self, token: RequestToken, value: T) -> bool {
+        self.complete_inner(token, value, true)
+    }
+
+    fn complete_inner(&self, token: RequestToken, value: T, capture_timing: bool) -> bool {
         let slot = &self.slots[token.index()];
         loop {
             if slot.generation.load(Ordering::Acquire) != token.generation() {
@@ -187,6 +223,10 @@ impl<T> CompletionTable<T> {
             }
         }
 
+        if capture_timing {
+            slot.completed_tick.store(timing_tick(), Ordering::Relaxed);
+        }
+
         // SAFETY: DRIVER_CLAIMED gives the connection task exclusive write
         // access. The receiver cannot read until READY is published.
         unsafe { (*slot.value.get()).write(value) };
@@ -209,6 +249,22 @@ impl<T> CompletionTable<T> {
         self.active.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn enable_timing(&self, token: RequestToken) {
+        let slot = &self.slots[token.index()];
+        debug_assert_eq!(slot.generation.load(Ordering::Relaxed), token.generation());
+        slot.sent_tick.store(0, Ordering::Relaxed);
+        slot.completed_tick.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn mark_sent(&self, token: RequestToken) {
+        let slot = &self.slots[token.index()];
+        if slot.generation.load(Ordering::Acquire) == token.generation()
+            && slot.state.load(Ordering::Acquire) & OCCUPIED != 0
+        {
+            slot.sent_tick.store(timing_tick(), Ordering::Release);
+        }
+    }
+
     fn receive(&self, token: RequestToken) -> Option<T> {
         let slot = &self.slots[token.index()];
         debug_assert_eq!(slot.generation.load(Ordering::Acquire), token.generation());
@@ -228,6 +284,21 @@ impl<T> CompletionTable<T> {
             self.release(token);
         }
         Some(value)
+    }
+
+    fn receive_timed(&self, token: RequestToken) -> Option<TimedResponse<T>> {
+        let slot = &self.slots[token.index()];
+        if slot.state.load(Ordering::Acquire) & READY == 0 {
+            return None;
+        }
+        let sent_tick = slot.sent_tick.load(Ordering::Relaxed);
+        let completed_tick = slot.completed_tick.load(Ordering::Relaxed);
+        let timing = AttemptTiming {
+            sent_to_completed: (sent_tick != 0 && completed_tick >= sent_tick)
+                .then(|| Duration::from_nanos(completed_tick - sent_tick)),
+        };
+        self.receive(token)
+            .map(|value| TimedResponse { value, timing })
     }
 
     fn receiver_dropped(&self, token: RequestToken) {
@@ -277,6 +348,23 @@ impl<T> ResponseFuture<T> {
         self.table.abort(self.token);
         self.completed = true;
     }
+
+    #[inline]
+    pub(crate) fn with_timing(self) -> TimedResponseFuture<T> {
+        TimedResponseFuture { inner: self }
+    }
+
+    fn poll_timed(&mut self, context: &mut Context<'_>) -> Poll<TimedResponse<T>> {
+        assert!(!self.completed, "ResponseFuture polled after completion");
+        let slot = &self.table.slots[self.token.index()];
+        slot.waker.register(context.waker());
+        if let Some(response) = self.table.receive_timed(self.token) {
+            self.completed = true;
+            Poll::Ready(response)
+        } else {
+            Poll::Pending
+        }
+    }
 }
 
 impl<T> Unpin for ResponseFuture<T> {}
@@ -304,6 +392,21 @@ impl<T> Future for ResponseFuture<T> {
         } else {
             Poll::Pending
         }
+    }
+}
+
+/// Allocation-free future that preserves the driver's physical send timing.
+pub struct TimedResponseFuture<T> {
+    inner: ResponseFuture<T>,
+}
+
+impl<T> Unpin for TimedResponseFuture<T> {}
+
+impl<T> Future for TimedResponseFuture<T> {
+    type Output = TimedResponse<T>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.poll_timed(context)
     }
 }
 
