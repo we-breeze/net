@@ -33,6 +33,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "brz-ds"
+version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d33426295a21583e33b7f549518c0ce229856c73d598f22f06850e32d73b3811"
+dependencies = [
+ "crossbeam-utils",
+ "mimalloc",
+]
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -59,16 +69,6 @@ name = "crossbeam-utils"
 version = "0.8.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
-
-[[package]]
-name = "brz-ds"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d33426295a21583e33b7f549518c0ce229856c73d598f22f06850e32d73b3811"
-dependencies = [
- "crossbeam-utils",
- "mimalloc",
-]
 
 [[package]]
 name = "errno"
@@ -191,8 +191,8 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "atomic-waker",
- "bytes",
  "brz-ds",
+ "bytes",
  "loom",
  "parking_lot",
  "thiserror",
