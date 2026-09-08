@@ -1,12 +1,12 @@
-# net
+# brz-net
 
-`net` 是 Breeze SDK 共用的、协议无关的单连接异步传输层。Cargo package
-直接叫 `net`；消费方可重命名为 `brz-net`，在 Rust 代码中通过 `brz_net`
-使用。
+`brz-net` 是 Breeze SDK 共用的、协议无关的单连接异步传输层。Rust 库名保留
+`net`；以下依赖别名让消费方继续通过 `brz_net` 使用。版本 `0.0.2` 将在首次
+成功执行 Publish 后可用。
 
 ```toml
 [dependencies]
-brz-net = { package = "net", path = "crates/breeze/net" }
+brz-net = { package = "brz-net", version = "0.0.2" }
 ```
 
 ## 核心模型
@@ -69,7 +69,7 @@ brz_net::init_global_request_arena(32 * 1024 * 1024)?; // 总计 64 MiB
 
 ## 动态接收 Ring Buffer
 
-每个物理连接惰性创建一个默认 8 KiB 的 `RxBuffer`，最大默认 64 MiB。socket
+每个物理连接惰性创建一个默认 2 KiB 的 `RxBuffer`，最大默认 64 MiB。socket
 readiness 到达后，连接 task 会持续读取到 `WouldBlock`；如果 ring 先写满，则先让
 协议解析已有数据。协议读到 frame/body 长度后通过 `reserve` 一次预留剩余容量，再
 继续读取。因此大响应不需要切换独立 buffer，body、协议尾部和后续 pipeline response
@@ -177,3 +177,46 @@ cargo clippy --all-targets -- -D warnings
 RUSTFLAGS="--cfg loom -C debug-assertions" \
   cargo test --release loom_ --lib -- --test-threads=1
 ```
+
+## CI and publishing
+
+Pushes and pull requests run formatting, Clippy with warnings denied, all
+test targets, release-mode library tests, and Loom models. Cargo.lock is
+tracked for reproducible checks. The request arena uses crates.io `brz-ds`
+version `0.0.2` with default features disabled.
+
+The default branch is `main`. Grant this public repository access to the
+`we-breeze` organization Actions secret `CARGO_REGISTRY_TOKEN`; the token must
+allow creating and publishing `brz-net`. Repository rules must allow Actions
+to push version commits and create tags (`contents: write`).
+
+Use **Actions → Publish → Run workflow**, select `main`, and leave `retry_tag`
+empty. The workflow increments the greatest `v0.0.x` tag, updates Cargo.toml
+and Cargo.lock, runs validation and a publishing dry run, atomically pushes
+the version commit and annotated tag, then publishes to crates.io. With the
+existing `v0.0.1` tag, the next release is `v0.0.2`; this replaces the initial
+unpublished Cargo version `0.1.0`. Ordinary pushes and merges only run CI.
+
+If upload fails after the tag is pushed, start a new run with `retry_tag` set
+to that existing tag. This field does not choose a new version. Check crates.io
+before retrying an upload timeout, since published versions cannot be
+overwritten. Publishing is serialized and rejects stale checkouts. Source
+fixes require a new release. No GitHub Release is created.
+
+## Operational safety
+
+This is a raw TCP transport; it does not provide TLS. Protocol integrations
+must choose trusted endpoints and provide any required authentication and
+transport encryption. Do not accept arbitrary user-controlled destination
+addresses without application-level validation.
+
+Receive limits apply to the active ring, not to the total memory retained by
+response guards. Applications should bound retained responses and endpoint
+counts. The process-wide request arena reserves 128 MiB by default and can be
+configured before first use. Individual requests are bounded by the session's
+256 slots and timeouts; protocols remain responsible for validating frame
+lengths and contents.
+
+## License
+
+Licensed under the MIT license. See [LICENSE-MIT](LICENSE-MIT).

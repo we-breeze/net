@@ -498,27 +498,32 @@ struct Releases {
 }
 
 struct Backing {
-    data: UnsafeCell<Box<[MaybeUninit<u8>]>>,
+    data: Box<[UnsafeCell<MaybeUninit<u8>>]>,
 }
 
 impl Backing {
     fn new(capacity: usize) -> Self {
         Self {
-            data: UnsafeCell::new(Box::<[u8]>::new_uninit_slice(capacity)),
+            // SAFETY: every bit pattern, including uninitialized bytes, is valid
+            // for UnsafeCell<MaybeUninit<u8>>. No byte is read before the driver
+            // initializes its writable interval.
+            data: unsafe {
+                Box::<[UnsafeCell<MaybeUninit<u8>>]>::new_uninit_slice(capacity).assume_init()
+            },
         }
     }
 
     #[inline]
     fn len(&self) -> usize {
-        // SAFETY: the boxed allocation is never replaced or resized.
-        unsafe { (&*self.data.get()).len() }
+        self.data.len()
     }
 
     #[inline]
     fn ptr(&self) -> *mut u8 {
-        // SAFETY: callers enforce disjoint initialized/readable and writable
-        // ring intervals; the boxed allocation itself never moves.
-        unsafe { (&*self.data.get()).as_ptr().cast_mut().cast::<u8>() }
+        // UnsafeCell and MaybeUninit preserve u8's layout. Interior mutability
+        // belongs to the allocation's bytes, not merely to the owning Box.
+        // Callers enforce disjoint readable and writable ring intervals.
+        self.data.as_ptr().cast_mut().cast::<u8>()
     }
 
     fn segments(&self, start: usize, length: usize) -> (&[u8], &[u8]) {
@@ -553,6 +558,17 @@ mod tests {
 
     fn write(buffer: &mut RxBuffer, bytes: &[u8]) {
         buffer.extend_from_slice(bytes).unwrap();
+    }
+
+    #[test]
+    fn retained_slice_stays_valid_while_disjoint_ring_bytes_are_written() {
+        let mut buffer = RxBuffer::new(8, 64);
+        buffer.extend_from_slice(b"abcd").unwrap();
+        let frame = buffer.take(4).into_contiguous().unwrap();
+        let borrowed = frame.as_ref();
+        buffer.extend_from_slice(b"efgh").unwrap();
+        assert_eq!(borrowed, b"abcd");
+        assert_eq!(buffer.take(4).copy_range(0..4).as_ref(), b"efgh");
     }
 
     #[test]

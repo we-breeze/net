@@ -1045,7 +1045,10 @@ mod tests {
             .unwrap();
 
         wait_until(|| calls.load(Ordering::SeqCst) >= 2).await;
-        assert_eq!(source.snapshot().as_ref(), ["198.51.100.1:80".parse().unwrap()]);
+        assert_eq!(
+            source.snapshot().as_ref(),
+            ["198.51.100.1:80".parse().unwrap()]
+        );
     }
 
     #[tokio::test]
@@ -1105,11 +1108,16 @@ mod tests {
 
     #[test]
     fn fingerprint_never_replaces_exact_set_comparison() {
-        let first = Ipv4Snapshot::new(vec![Ipv4Addr::new(192, 0, 2, 4), Ipv4Addr::new(192, 0, 2, 7)])
-            .unwrap();
-        let colliding =
-            Ipv4Snapshot::new(vec![Ipv4Addr::new(192, 0, 2, 5), Ipv4Addr::new(192, 0, 2, 6)])
-                .unwrap();
+        let first = Ipv4Snapshot::new(vec![
+            Ipv4Addr::new(192, 0, 2, 4),
+            Ipv4Addr::new(192, 0, 2, 7),
+        ])
+        .unwrap();
+        let colliding = Ipv4Snapshot::new(vec![
+            Ipv4Addr::new(192, 0, 2, 5),
+            Ipv4Addr::new(192, 0, 2, 6),
+        ])
+        .unwrap();
 
         assert_eq!(first.fingerprint.len, colliding.fingerprint.len);
         assert_eq!(first.fingerprint.sum, colliding.fingerprint.sum);
