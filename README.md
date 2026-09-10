@@ -6,7 +6,7 @@
 
 ```toml
 [dependencies]
-brz-net = { package = "brz-net", version = "0.0.2" }
+brz-net = "0.0.3"
 ```
 
 ## 核心模型
@@ -220,3 +220,14 @@ lengths and contents.
 ## License
 
 Licensed under the MIT license. See [LICENSE-MIT](LICENSE-MIT).
+
+## Crate naming
+
+The package name is `brz-net`; the Rust library name is `brz_net`.
+Use `brz_net::...` in Rust code. This replaces the previous `net`
+library name. Existing explicit dependency aliases remain supported.
+
+```toml
+[dependencies]
+brz-net = "0.0.3"
+```

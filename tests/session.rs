@@ -7,11 +7,11 @@ use std::{
     time::Duration,
 };
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use net::{
+use brz_net::{
     DecodedResponse, HandshakeStatus, MAX_IN_FLIGHT, Node, NodeConnectionObserver, NodeOptions,
     ReplicaSet, RequestTarget, RequestToken, RxBuffer, SessionError, SessionProtocol, Sharded,
 };
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,

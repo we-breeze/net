@@ -8,7 +8,7 @@ repository = "https://github.com/we-breeze/net"
 readme = "README.md"
 
 [lib]
-name = "net"
+name = "brz_net"
 
 [dependencies]
 atomic-waker = "1"
