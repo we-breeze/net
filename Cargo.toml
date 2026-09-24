@@ -1,6 +1,6 @@
 [package]
 name = "brz-net"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "High-performance single-connection async transport for Breeze SDKs"
 license = "MIT"
