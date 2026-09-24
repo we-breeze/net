@@ -14,7 +14,7 @@ name = "brz_net"
 atomic-waker = "1"
 arc-swap = "1"
 bytes = "1"
-brz-ds = { package = "brz-ds", version = "0.0.2", default-features = false }
+brz-ds = { package = "brz-ds", version = "0.0.4", default-features = false }
 parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
