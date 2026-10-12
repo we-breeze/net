@@ -93,14 +93,23 @@ impl QuotaSelector {
     #[inline]
     pub fn select(&self) -> QuotaTicket {
         let count = self.inner.replicas.len();
-        let mut index = self.inner.current.load(Ordering::Relaxed);
-
-        if count > 1
-            && self.inner.replicas[index]
+        loop {
+            let index = self.inner.current.load(Ordering::Acquire);
+            if count == 1 {
+                return self.ticket(index);
+            }
+            if self.inner.replicas[index]
                 .used_micros
-                .load(Ordering::Relaxed)
-                >= self.inner.quota_micros
-        {
+                .load(Ordering::Acquire)
+                < self.inner.quota_micros
+            {
+                // A rotation resets the previous replica's quota. Seeing that
+                // reset must not let a selector return the previous replica.
+                if self.inner.current.load(Ordering::Acquire) == index {
+                    return self.ticket(index);
+                }
+                continue;
+            }
             let next = (index + 1) % count;
             if self
                 .inner
@@ -110,14 +119,10 @@ impl QuotaSelector {
             {
                 self.inner.replicas[index]
                     .used_micros
-                    .store(0, Ordering::Relaxed);
-                index = next;
-            } else {
-                index = self.inner.current.load(Ordering::Acquire);
+                    .store(0, Ordering::Release);
+                return self.ticket(next);
             }
         }
-
-        self.ticket(index)
     }
 
     #[inline]
@@ -620,29 +625,31 @@ mod tests {
 
     #[test]
     fn concurrent_selectors_observe_one_atomic_quota_rotation() {
-        let balancer = QuotaSelector::new(3, QuotaBalancerOptions::default()).unwrap();
-        finish(balancer.select(), Duration::from_secs(2), true);
+        for _ in 0..64 {
+            let balancer = QuotaSelector::new(3, QuotaBalancerOptions::default()).unwrap();
+            finish(balancer.select(), Duration::from_secs(2), true);
 
-        let workers = 16;
-        let barrier = Arc::new(Barrier::new(workers));
-        let handles = (0..workers)
-            .map(|_| {
-                let balancer = balancer.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    let guard = balancer.select();
-                    let index = guard.index();
-                    finish(guard, Duration::ZERO, true);
-                    index
+            let workers = 16;
+            let barrier = Arc::new(Barrier::new(workers));
+            let handles = (0..workers)
+                .map(|_| {
+                    let balancer = balancer.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let guard = balancer.select();
+                        let index = guard.index();
+                        finish(guard, Duration::ZERO, true);
+                        index
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
-        for handle in handles {
-            assert_eq!(handle.join().unwrap(), 1);
+            for handle in handles {
+                assert_eq!(handle.join().unwrap(), 1);
+            }
+            assert!(balancer.snapshots()[1].current);
         }
-        assert!(balancer.snapshots()[1].current);
     }
 
     #[test]
