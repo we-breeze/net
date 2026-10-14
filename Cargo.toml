@@ -1,6 +1,6 @@
 [package]
 name = "brz-net"
-version = "0.0.5"
+version = "0.0.6"
 edition = "2024"
 description = "High-performance single-connection async transport for Breeze SDKs"
 license = "MIT"
@@ -14,7 +14,7 @@ name = "brz_net"
 atomic-waker = "1"
 arc-swap = "1"
 bytes = "1"
-brz-ds = { package = "brz-ds", version = "0.0.5", default-features = false }
+brz-ds = { package = "brz-ds", version = "0.0.6", default-features = false }
 parking_lot = "0.12"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
