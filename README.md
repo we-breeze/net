@@ -6,7 +6,7 @@
 
 ```toml
 [dependencies]
-brz-net = "0.0.6"
+brz-net = "0.0.7"
 ```
 
 ## 核心模型
@@ -229,5 +229,5 @@ library name. Existing explicit dependency aliases remain supported.
 
 ```toml
 [dependencies]
-brz-net = "0.0.6"
+brz-net = "0.0.7"
 ```
